@@ -2,4 +2,7 @@
 *.pyc
 .venv/
 *.egg-info/
+build/
+dist/
+*.spec
 

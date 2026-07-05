@@ -2,8 +2,9 @@
 GST Reconciliation Tool — desktop GUI (Tkinter, stdlib only).
 
 Layout:
-  Left panel  : client list (add / search / delete)
-  Right panel : tabs for Upload, History, Reconciliation, Past Reports
+  Login screen: PIN entry (existing install) or PIN setup (first run).
+  Main window left panel  : client list (add / search / delete)
+  Main window right panel : tabs for Upload, History, Reconciliation, Past Reports
 """
 import os
 import sys
@@ -14,9 +15,29 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 
-from . import db, parsers, reconcile, report
+from . import db, parsers, reconcile, report, service, security
 
 APP_TITLE = "GST Reconciliation Tool"
+
+
+def icon_path():
+    """Location of the app icon, whether running from source or from a
+    PyInstaller-frozen exe (whose bundled data lands in sys._MEIPASS)."""
+    if getattr(sys, "frozen", False):
+        base = sys._MEIPASS
+    else:
+        base = os.path.join(os.path.dirname(__file__), "..")
+    path = os.path.join(base, "assets", "icon.ico")
+    return path if os.path.exists(path) else None
+
+
+def set_app_icon(window):
+    path = icon_path()
+    if path:
+        try:
+            window.iconbitmap(path)
+        except tk.TclError:
+            pass
 
 
 def open_file(path):
@@ -31,15 +52,172 @@ def open_file(path):
         messagebox.showerror("Could not open file", str(e))
 
 
+class LoginScreen(tk.Tk):
+    """Shown before anything else. Branches to PIN setup or PIN entry
+    depending on db.needs_setup(), and only unblocks the main App once
+    db.unlock_or_init() succeeds."""
+
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("420x260")
+        self.resizable(False, False)
+        set_app_icon(self)
+        self.unlocked = False
+
+        self.is_first_run = db.needs_setup()
+
+        frame = ttk.Frame(self, padding=24)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text=APP_TITLE, font=("Arial", 14, "bold")).pack(anchor="w")
+
+        if self.is_first_run:
+            ttk.Label(frame, text="First run on this machine — set a PIN to protect your data.\n"
+                                  "This PIN is required every time the app opens, and cannot be "
+                                  "recovered if forgotten (see vendor support for a reset).",
+                      foreground="#595959", wraplength=370, justify="left").pack(anchor="w", pady=(6, 16))
+            ttk.Label(frame, text="New PIN").pack(anchor="w")
+            self.pin_var = tk.StringVar()
+            ttk.Entry(frame, textvariable=self.pin_var, show="*").pack(fill="x", pady=(0, 10))
+            ttk.Label(frame, text="Confirm PIN").pack(anchor="w")
+            self.pin2_var = tk.StringVar()
+            entry2 = ttk.Entry(frame, textvariable=self.pin2_var, show="*")
+            entry2.pack(fill="x", pady=(0, 10))
+            entry2.bind("<Return>", lambda e: self._submit())
+            btn_text = "Set PIN and continue"
+        else:
+            ttk.Label(frame, text="Enter your PIN to unlock this client's data.",
+                      foreground="#595959", wraplength=370, justify="left").pack(anchor="w", pady=(6, 16))
+            ttk.Label(frame, text="PIN").pack(anchor="w")
+            self.pin_var = tk.StringVar()
+            entry = ttk.Entry(frame, textvariable=self.pin_var, show="*")
+            entry.pack(fill="x", pady=(0, 10))
+            entry.bind("<Return>", lambda e: self._submit())
+            entry.focus_set()
+            btn_text = "Unlock"
+
+        self.error_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.error_var, foreground="#9C0006").pack(anchor="w", pady=(0, 8))
+
+        ttk.Button(frame, text=btn_text, command=self._submit).pack(anchor="e")
+
+    def _submit(self):
+        pin = self.pin_var.get()
+        if not pin:
+            self.error_var.set("PIN cannot be empty.")
+            return
+        if self.is_first_run:
+            if pin != self.pin2_var.get():
+                self.error_var.set("PINs do not match.")
+                return
+            if len(pin) < 4:
+                self.error_var.set("Use at least 4 characters.")
+                return
+        try:
+            db.unlock_or_init(pin)
+        except security.SecurityError:
+            self.error_var.set("Incorrect PIN, or this data was created on a different computer.")
+            return
+        except Exception as e:
+            self.error_var.set(f"Could not unlock: {e}")
+            return
+        self.unlocked = True
+        self.destroy()
+
+
+class ConflictResolutionDialog(tk.Toplevel):
+    """Shows every Purchase Register row awaiting an Overwrite/Ignore decision,
+    stored value vs newly-uploaded value side by side, per HANDOFF's 'one real
+    GUI gap'. Wired to db.list_pending_conflicts() / db.resolve_conflict()."""
+
+    def __init__(self, parent, client_id, on_close=None):
+        super().__init__(parent)
+        self.client_id = client_id
+        self.on_close = on_close
+        self.title("Pending Purchase Register Conflicts")
+        self.geometry("980x460")
+        self.transient(parent)
+        set_app_icon(self)
+
+        ttk.Label(self, text="These invoices were re-uploaded with a DIFFERENT amount than what's "
+                             "already stored. They are excluded from reconciliation until you resolve "
+                             "each one — Overwrite uses the new upload, Ignore keeps the stored value.",
+                  foreground="#595959", wraplength=940, justify="left", padding=10).pack(anchor="w")
+
+        cols = ("Invoice No", "GSTIN", "Stored Gross", "New Gross", "Stored CGST", "New CGST",
+                "Stored SGST", "New SGST", "Stored IGST", "New IGST")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
+        for c in cols:
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=90, anchor="w")
+        self.tree.pack(fill="both", expand=True, padx=10)
+
+        btns = ttk.Frame(self, padding=10)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Overwrite Selected", command=lambda: self._resolve_selected("overwrite")).pack(side="left")
+        ttk.Button(btns, text="Ignore Selected", command=lambda: self._resolve_selected("ignore")).pack(side="left", padx=6)
+        ttk.Separator(btns, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Button(btns, text="Overwrite All", command=lambda: self._resolve_all("overwrite")).pack(side="left")
+        ttk.Button(btns, text="Ignore All", command=lambda: self._resolve_all("ignore")).pack(side="left", padx=6)
+        ttk.Button(btns, text="Close", command=self._close).pack(side="right")
+
+        self._rows = []
+        self._refresh()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.grab_set()
+
+    def _refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        self._rows = db.list_pending_conflicts(self.client_id)
+        for item in self._rows:
+            p, s = item["pending"], item["stored"]
+            self.tree.insert("", "end", iid=str(p["id"]), values=(
+                p["invoice_no"], p["gstin"],
+                s["gross_total"] if s else "n/a", p["gross_total"],
+                s["cgst"] if s else "n/a", p["cgst"],
+                s["sgst"] if s else "n/a", p["sgst"],
+                s["igst"] if s else "n/a", p["igst"],
+            ))
+        if not self._rows:
+            messagebox.showinfo("No conflicts", "No pending conflicts remain.", parent=self)
+            self._close()
+
+    def _resolve_selected(self, action):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Nothing selected", "Select one or more rows first.", parent=self)
+            return
+        for iid in sel:
+            db.resolve_conflict(int(iid), action)
+        self._refresh()
+
+    def _resolve_all(self, action):
+        if not self._rows:
+            return
+        if not messagebox.askyesno("Confirm", f"{action.capitalize()} all {len(self._rows)} pending conflicts?", parent=self):
+            return
+        db.resolve_all_conflicts(self.client_id, action)
+        self._refresh()
+
+    def _close(self):
+        self.grab_release()
+        self.destroy()
+        if self.on_close:
+            self.on_close()
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
         self.geometry("1180x720")
         self.minsize(1000, 620)
+        set_app_icon(self)
 
-        db.init_db()
         self.current_client_id = None
+        self._results = None
+        self._current_fy_meta = None
 
         self._build_layout()
         self._refresh_client_list()
@@ -82,8 +260,13 @@ class App(tk.Tk):
         right = ttk.Frame(root)
         right.pack(side="left", fill="both", expand=True)
 
+        header_row = ttk.Frame(right)
+        header_row.pack(fill="x")
         self.header_var = tk.StringVar(value="Select or add a client to begin")
-        ttk.Label(right, textvariable=self.header_var, font=("Arial", 13, "bold")).pack(anchor="w", pady=(0, 8))
+        ttk.Label(header_row, textvariable=self.header_var, font=("Arial", 13, "bold")).pack(side="left", pady=(0, 8))
+        self.conflicts_btn = ttk.Button(header_row, text="Resolve Pending Conflicts",
+                                         command=self._open_conflicts_dialog, state="disabled")
+        self.conflicts_btn.pack(side="right")
 
         self.notebook = ttk.Notebook(right)
         self.notebook.pack(fill="both", expand=True)
@@ -111,6 +294,7 @@ class App(tk.Tk):
             self.notebook.tab(i, state=state if enabled else "disabled")
         for w in (self.upload_g2a_btn, self.upload_pr_btn):
             w.configure(state=state)
+        self.conflicts_btn.configure(state=state)
 
     # ---------------- client list ----------------
 
@@ -138,6 +322,7 @@ class App(tk.Tk):
         dlg.title("Add Client")
         dlg.geometry("360x160")
         dlg.transient(self)
+        set_app_icon(dlg)
         ttk.Label(dlg, text="Client / Business Name*").pack(anchor="w", padx=12, pady=(12, 0))
         name_var = tk.StringVar()
         ttk.Entry(dlg, textvariable=name_var).pack(fill="x", padx=12)
@@ -177,6 +362,21 @@ class App(tk.Tk):
             self._set_tabs_enabled(False)
             self._refresh_client_list()
 
+    # ---------------- Pending conflicts dialog ----------------
+
+    def _open_conflicts_dialog(self):
+        if not self.current_client_id:
+            return
+        pending = db.list_pending_conflicts(self.current_client_id)
+        if not pending:
+            messagebox.showinfo("No conflicts", "There are no pending Purchase Register conflicts for this client.")
+            return
+        ConflictResolutionDialog(self, self.current_client_id, on_close=self._on_conflicts_closed)
+
+    def _on_conflicts_closed(self):
+        self._refresh_history_tab()
+        self._refresh_recon_tab()
+
     # ---------------- Upload tab ----------------
 
     def _build_upload_tab(self):
@@ -190,12 +390,14 @@ class App(tk.Tk):
                                           command=self._upload_gstr2a, state="disabled")
         self.upload_g2a_btn.pack(anchor="w", pady=(0, 16))
 
-        ttk.Label(t, text="Step 2 — Upload the Purchase Register (monthly file)",
+        ttk.Label(t, text="Step 2 — Upload the Purchase Register (monthly file, or a full year at once)",
                   font=("Arial", 10, "bold")).pack(anchor="w")
-        ttk.Label(t, text="Upload each month's file as it becomes available. New invoices are "
-                          "added; anything already stored is automatically skipped, so it's safe "
-                          "to re-upload the same file by mistake.",
-                  foreground="#595959").pack(anchor="w", pady=(0, 6))
+        ttk.Label(t, text="Upload each month's file as it becomes available, or a full-year file — rows "
+                          "are auto-tagged by month/FY. Anything already stored is automatically skipped, "
+                          "so it's safe to re-upload the same file by mistake. Re-uploading the same "
+                          "invoice with a DIFFERENT amount is held as a pending conflict for review "
+                          "(see the 'Resolve Pending Conflicts' button above).",
+                  foreground="#595959", wraplength=900, justify="left").pack(anchor="w", pady=(0, 6))
         self.upload_pr_btn = ttk.Button(t, text="Select Purchase Register file (.xls/.xlsx)...",
                                          command=self._upload_purchase, state="disabled")
         self.upload_pr_btn.pack(anchor="w", pady=(0, 16))
@@ -223,7 +425,7 @@ class App(tk.Tk):
             snap_id = db.add_gstr2a_snapshot(self.current_client_id, os.path.basename(path), gen_date, df)
             periods = sorted(df["Period"].unique())
             self._log(self.upload_log,
-                       f"GSTR-2A loaded: {len(df)} invoice rows, periods {periods[0]}\u2013{periods[-1]}, "
+                       f"GSTR-2A loaded: {len(df)} invoice rows, periods {periods[0]}–{periods[-1]}, "
                        f"portal generation date {gen_date or 'n/a'}. Saved as snapshot #{snap_id}.")
             messagebox.showinfo("GSTR-2A uploaded",
                                  f"{len(df)} invoice rows saved as a new snapshot.\n\n"
@@ -247,15 +449,15 @@ class App(tk.Tk):
             entries = parsers.parse_purchase_register(path)
             result = db.add_purchase_batch(self.current_client_id, os.path.basename(path), entries)
             self._log(self.upload_log,
-                       f"Purchase Register file processed: {result['total_in_file']} rows read \u2192 "
+                       f"Purchase Register file processed: {result['total_in_file']} rows read → "
                        f"{result['new_rows']} new, {result['duplicate_rows_skipped']} already stored (skipped), "
-                       f"{result['conflict_rows']} flagged as amount conflicts for review.")
+                       f"{result['pending_conflicts']} flagged as amount conflicts for review.")
             msg = (f"{result['new_rows']} new entries added.\n"
                    f"{result['duplicate_rows_skipped']} rows were already in the system and skipped.\n")
-            if result["conflict_rows"]:
-                msg += (f"\n{result['conflict_rows']} entries have the same invoice number as one already "
-                        f"stored but a DIFFERENT amount — both were kept. Review these in the "
-                        f"Reconciliation tab's Purchase Register conflicts before relying on totals.")
+            if result["pending_conflicts"]:
+                msg += (f"\n{result['pending_conflicts']} entries have the same invoice number as one already "
+                        f"stored but a DIFFERENT amount. Use 'Resolve Pending Conflicts' above before "
+                        f"relying on totals — these are excluded from reconciliation until resolved.")
             messagebox.showinfo("Purchase Register uploaded", msg)
         except parsers.ParseError as e:
             messagebox.showerror("Could not read file", str(e))
@@ -278,7 +480,7 @@ class App(tk.Tk):
         self.snap_tree.pack(fill="x", pady=(4, 16))
 
         ttk.Label(t, text="Purchase Register Upload Batches", font=("Arial", 10, "bold")).pack(anchor="w")
-        cols2 = ("Uploaded", "File", "Rows in File", "New", "Skipped (dup)", "Conflicts")
+        cols2 = ("Uploaded", "File", "Rows in File", "New", "Skipped (dup)", "Pending Conflicts")
         self.batch_tree = ttk.Treeview(t, columns=cols2, show="headings", height=10)
         for c in cols2:
             self.batch_tree.heading(c, text=c)
@@ -292,7 +494,7 @@ class App(tk.Tk):
         for s in db.list_snapshots(self.current_client_id):
             self.snap_tree.insert("", "end", values=(
                 s["uploaded_at"], s["source_filename"], s["generation_date"] or "n/a",
-                f"{s['period_min']}\u2013{s['period_max']}", s["row_count"],
+                f"{s['period_min']}–{s['period_max']}", s["row_count"],
             ))
         self.batch_tree.delete(*self.batch_tree.get_children())
         for b in db.list_purchase_batches(self.current_client_id):
@@ -306,16 +508,30 @@ class App(tk.Tk):
     def _build_recon_tab(self):
         t = self.tab_recon
         top = ttk.Frame(t)
-        top.pack(fill="x", pady=(0, 10))
-        ttk.Label(top, text="GSTR-2A snapshot to reconcile against:").pack(side="left")
+        top.pack(fill="x", pady=(0, 4))
+        ttk.Label(top, text="Financial Year:").pack(side="left")
+        self.fy_var = tk.StringVar()
+        self.fy_combo = ttk.Combobox(top, textvariable=self.fy_var, width=14, state="readonly")
+        self.fy_combo.pack(side="left", padx=8)
+        ttk.Label(top, text="GSTR-2A snapshot:").pack(side="left", padx=(16, 0))
         self.snapshot_var = tk.StringVar()
-        self.snapshot_combo = ttk.Combobox(top, textvariable=self.snapshot_var, width=60, state="readonly")
+        self.snapshot_combo = ttk.Combobox(top, textvariable=self.snapshot_var, width=50, state="readonly")
         self.snapshot_combo.pack(side="left", padx=8)
         ttk.Button(top, text="Run Reconciliation", command=self._run_reconciliation).pack(side="left", padx=8)
 
+        month_row = ttk.Frame(t)
+        month_row.pack(fill="x", pady=(0, 10))
+        ttk.Label(month_row, text="Export one month of Purchase Register data:").pack(side="left")
+        self.month_var = tk.StringVar()
+        self.month_combo = ttk.Combobox(month_row, textvariable=self.month_var, width=14, state="readonly")
+        self.month_combo.pack(side="left", padx=8)
+        ttk.Button(month_row, text="Export Month to Excel...", command=self._export_month).pack(side="left")
+
         self.recon_summary_var = tk.StringVar(value="")
         ttk.Label(t, textvariable=self.recon_summary_var, foreground="#1F4E78",
-                  font=("Arial", 10, "bold")).pack(anchor="w", pady=(0, 6))
+                  font=("Arial", 10, "bold"), wraplength=1000, justify="left").pack(anchor="w", pady=(0, 2))
+        self.recon_cutoff_var = tk.StringVar(value="")
+        ttk.Label(t, textvariable=self.recon_cutoff_var, font=("Arial", 9, "bold")).pack(anchor="w", pady=(0, 6))
 
         filt = ttk.Frame(t)
         filt.pack(fill="x", pady=(0, 4))
@@ -323,7 +539,7 @@ class App(tk.Tk):
         self.category_var = tk.StringVar(value="value_tax_mismatches")
         self.category_combo = ttk.Combobox(filt, textvariable=self.category_var, state="readonly", width=45, values=[
             "value_tax_mismatches", "probable_matches", "only_in_gstr2a",
-            "only_in_purchase_register", "purchase_register_conflicts", "matched_clean",
+            "only_in_purchase_register", "matched_clean", "multi_rate_reference",
         ])
         self.category_combo.pack(side="left", padx=8)
         self.category_combo.bind("<<ComboboxSelected>>", lambda e: self._render_category())
@@ -344,40 +560,65 @@ class App(tk.Tk):
         self._snap_lookup = {}
         values = []
         for s in snaps:
-            label = f"#{s['snapshot_id']}  uploaded {s['uploaded_at']}  ({s['period_min']}\u2013{s['period_max']}, {s['row_count']} rows)"
+            label = f"#{s['snapshot_id']}  uploaded {s['uploaded_at']}  ({s['period_min']}–{s['period_max']}, {s['row_count']} rows)"
             values.append(label)
             self._snap_lookup[label] = s["snapshot_id"]
         self.snapshot_combo.configure(values=values)
         if values:
             self.snapshot_combo.current(0)
+
+        fys = service.list_available_fys(self.current_client_id)
+        self.fy_combo.configure(values=fys)
+        if fys:
+            self.fy_combo.current(0)
+        else:
+            self.fy_var.set("")
+
+        months = db.list_available_months(self.current_client_id)
+        self.month_combo.configure(values=months)
+        if months:
+            self.month_combo.current(0)
+        else:
+            self.month_var.set("")
+
         self._results = None
+        self._current_fy_meta = None
         self.result_tree.delete(*self.result_tree.get_children())
         self.recon_summary_var.set("")
+        self.recon_cutoff_var.set("")
 
     def _run_reconciliation(self):
+        if not self.fy_var.get():
+            messagebox.showwarning("No financial year", "Upload at least one Purchase Register file first.")
+            return
         if not self.snapshot_var.get():
             messagebox.showwarning("No snapshot", "Upload a GSTR-2A file first (Upload Data tab).")
             return
         snap_id = self._snap_lookup[self.snapshot_var.get()]
-        g2a_df = db.get_snapshot_invoices(snap_id)
-        pr_df = db.get_all_purchase_entries(self.current_client_id)
-        if len(pr_df) == 0:
-            messagebox.showwarning("No purchase data", "Upload at least one Purchase Register file first.")
-            return
         try:
-            self._results = reconcile.run_reconciliation(g2a_df, pr_df)
-            self._results["purchase_register_conflicts"] = db.get_conflict_entries(self.current_client_id)
-            self._current_snapshot_id = snap_id
+            outcome = service.run_fy_reconciliation(self.current_client_id, self.fy_var.get(), snapshot_id=snap_id)
+        except ValueError as e:
+            messagebox.showwarning("Cannot reconcile", str(e))
+            return
         except Exception as e:
             messagebox.showerror("Reconciliation failed", f"{e}\n\n{traceback.format_exc()[-800:]}")
             return
 
+        self._results = outcome["results"]
+        self._current_fy_meta = outcome["meta"]
+        self._current_snapshot_id = snap_id
         r = self._results
         self.recon_summary_var.set(
-            f"Matched clean: {len(r['matched_clean'])}   |   Mismatches: {len(r['value_tax_mismatches'])}   |   "
-            f"Probable matches: {len(r['probable_matches'])}   |   Only in GSTR-2A: {len(r['only_in_gstr2a'])}   |   "
-            f"Only in books: {len(r['only_in_purchase_register'])}   |   PR conflicts: {len(r['purchase_register_conflicts'])}"
+            f"FY {self._current_fy_meta['fy_label']}  |  Matched clean: {len(r['matched_clean'])}   |   "
+            f"Mismatches: {len(r['value_tax_mismatches'])}   |   Probable matches: {len(r['probable_matches'])}   |   "
+            f"Only in GSTR-2A: {len(r['only_in_gstr2a'])}   |   Only in books: {len(r['only_in_purchase_register'])}   |   "
+            f"Pending conflicts (excluded): {self._current_fy_meta['pending_conflicts_count']}"
         )
+        days = self._current_fy_meta["days_until_cutoff"]
+        if days >= 0:
+            self.recon_cutoff_var.set(f"Late-filing cutoff: {self._current_fy_meta['cutoff_date']}  ({days} days remaining)")
+        else:
+            self.recon_cutoff_var.set(f"Late-filing cutoff: {self._current_fy_meta['cutoff_date']}  ({abs(days)} days PAST cutoff)")
         self._render_category()
 
     def _render_category(self):
@@ -405,20 +646,17 @@ class App(tk.Tk):
             messagebox.showwarning("Run reconciliation first", "Click 'Run Reconciliation' before exporting.")
             return
         client = db.get_client(self.current_client_id)
-        default_name = f"{client['name'].replace(' ', '_')}_GST_Reconciliation_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        fy_label = self._current_fy_meta["fy_label"]
+        default_name = f"{client['name'].replace(' ', '_')}_GST_Reconciliation_FY{fy_label}_{datetime.now().strftime('%Y%m%d')}.xlsx"
         path = filedialog.asksaveasfilename(
             title="Save reconciliation report", initialfile=default_name,
             defaultextension=".xlsx", filetypes=[("Excel workbook", "*.xlsx")],
         )
         if not path:
             return
-        snap = next(s for s in db.list_snapshots(self.current_client_id) if s["snapshot_id"] == self._current_snapshot_id)
-        pr_df = db.get_all_purchase_entries(self.current_client_id)
-        purchase_asof = pr_df["entry_date"].max() if len(pr_df) else ""
         try:
-            report.build_report(client["name"], client["gstin"], dict(snap), purchase_asof, self._results, path)
-            summary = {k: len(v) for k, v in self._results.items()}
-            db.log_recon_run(self.current_client_id, self._current_snapshot_id, purchase_asof, path, json.dumps(summary))
+            service.export_fy_reconciliation(self.current_client_id, fy_label, path,
+                                              snapshot_id=self._current_snapshot_id)
         except Exception as e:
             messagebox.showerror("Export failed", f"{e}\n\n{traceback.format_exc()[-800:]}")
             return
@@ -426,16 +664,37 @@ class App(tk.Tk):
         if messagebox.askyesno("Report saved", f"Report saved to:\n{path}\n\nOpen it now?"):
             open_file(path)
 
+    def _export_month(self):
+        if not self.month_var.get():
+            messagebox.showwarning("No month available", "Upload a Purchase Register file first.")
+            return
+        client = db.get_client(self.current_client_id)
+        year_month = self.month_var.get()
+        default_name = f"{client['name'].replace(' ', '_')}_Purchases_{year_month}.xlsx"
+        path = filedialog.asksaveasfilename(
+            title="Save month export", initialfile=default_name,
+            defaultextension=".xlsx", filetypes=[("Excel workbook", "*.xlsx")],
+        )
+        if not path:
+            return
+        try:
+            service.export_purchase_month(self.current_client_id, year_month, path)
+        except Exception as e:
+            messagebox.showerror("Export failed", f"{e}\n\n{traceback.format_exc()[-800:]}")
+            return
+        if messagebox.askyesno("Export saved", f"Saved to:\n{path}\n\nOpen it now?"):
+            open_file(path)
+
     # ---------------- Reports tab ----------------
 
     def _build_reports_tab(self):
         t = self.tab_reports
         ttk.Label(t, text="Past reconciliation reports for this client", font=("Arial", 10, "bold")).pack(anchor="w")
-        cols = ("Run Date", "GSTR-2A Snapshot", "Purchase Data As Of", "File")
+        cols = ("Run Date", "FY", "GSTR-2A Snapshot", "Purchase Data As Of", "File")
         self.reports_tree = ttk.Treeview(t, columns=cols, show="headings")
         for c in cols:
             self.reports_tree.heading(c, text=c)
-            self.reports_tree.column(c, width=200, anchor="w")
+            self.reports_tree.column(c, width=180, anchor="w")
         self.reports_tree.pack(fill="both", expand=True, pady=(4, 8))
         ttk.Button(t, text="Open Selected Report", command=self._open_selected_report).pack(anchor="w")
 
@@ -444,13 +703,15 @@ class App(tk.Tk):
             return
         self.reports_tree.delete(*self.reports_tree.get_children())
         for r in db.list_recon_runs(self.current_client_id):
-            self.reports_tree.insert("", "end", values=(r["run_at"], f"#{r['snapshot_id']}", r["purchase_asof"], r["report_path"]))
+            self.reports_tree.insert("", "end", values=(
+                r["run_at"], r["fy_label"] or "n/a", f"#{r['snapshot_id']}", r["purchase_asof"], r["report_path"],
+            ))
 
     def _open_selected_report(self):
         sel = self.reports_tree.selection()
         if not sel:
             return
-        path = self.reports_tree.item(sel[0])["values"][3]
+        path = self.reports_tree.item(sel[0])["values"][4]
         if os.path.exists(path):
             open_file(path)
         else:
@@ -458,5 +719,9 @@ class App(tk.Tk):
 
 
 def main():
+    login = LoginScreen()
+    login.mainloop()
+    if not login.unlocked:
+        return
     app = App()
     app.mainloop()
