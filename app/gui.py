@@ -513,11 +513,10 @@ class App(tk.Tk):
         self.fy_var = tk.StringVar()
         self.fy_combo = ttk.Combobox(top, textvariable=self.fy_var, width=14, state="readonly")
         self.fy_combo.pack(side="left", padx=8)
-        ttk.Label(top, text="GSTR-2A snapshot:").pack(side="left", padx=(16, 0))
-        self.snapshot_var = tk.StringVar()
-        self.snapshot_combo = ttk.Combobox(top, textvariable=self.snapshot_var, width=50, state="readonly")
-        self.snapshot_combo.pack(side="left", padx=8)
         ttk.Button(top, text="Run Reconciliation", command=self._run_reconciliation).pack(side="left", padx=8)
+        ttk.Label(top, text="GSTR-2A data used is automatically merged across every snapshot "
+                            "uploaded for this client — no manual selection needed.",
+                  foreground="#595959").pack(side="left", padx=(16, 0))
 
         month_row = ttk.Frame(t)
         month_row.pack(fill="x", pady=(0, 10))
@@ -556,17 +555,6 @@ class App(tk.Tk):
     def _refresh_recon_tab(self):
         if not self.current_client_id:
             return
-        snaps = db.list_snapshots(self.current_client_id)
-        self._snap_lookup = {}
-        values = []
-        for s in snaps:
-            label = f"#{s['snapshot_id']}  uploaded {s['uploaded_at']}  ({s['period_min']}–{s['period_max']}, {s['row_count']} rows)"
-            values.append(label)
-            self._snap_lookup[label] = s["snapshot_id"]
-        self.snapshot_combo.configure(values=values)
-        if values:
-            self.snapshot_combo.current(0)
-
         fys = service.list_available_fys(self.current_client_id)
         self.fy_combo.configure(values=fys)
         if fys:
@@ -591,12 +579,8 @@ class App(tk.Tk):
         if not self.fy_var.get():
             messagebox.showwarning("No financial year", "Upload at least one Purchase Register file first.")
             return
-        if not self.snapshot_var.get():
-            messagebox.showwarning("No snapshot", "Upload a GSTR-2A file first (Upload Data tab).")
-            return
-        snap_id = self._snap_lookup[self.snapshot_var.get()]
         try:
-            outcome = service.run_fy_reconciliation(self.current_client_id, self.fy_var.get(), snapshot_id=snap_id)
+            outcome = service.run_fy_reconciliation(self.current_client_id, self.fy_var.get())
         except ValueError as e:
             messagebox.showwarning("Cannot reconcile", str(e))
             return
@@ -606,7 +590,6 @@ class App(tk.Tk):
 
         self._results = outcome["results"]
         self._current_fy_meta = outcome["meta"]
-        self._current_snapshot_id = snap_id
         r = self._results
         self.recon_summary_var.set(
             f"FY {self._current_fy_meta['fy_label']}  |  Matched clean: {len(r['matched_clean'])}   |   "
@@ -615,10 +598,13 @@ class App(tk.Tk):
             f"Pending conflicts (excluded): {self._current_fy_meta['pending_conflicts_count']}"
         )
         days = self._current_fy_meta["days_until_cutoff"]
-        if days >= 0:
-            self.recon_cutoff_var.set(f"Late-filing cutoff: {self._current_fy_meta['cutoff_date']}  ({days} days remaining)")
-        else:
-            self.recon_cutoff_var.set(f"Late-filing cutoff: {self._current_fy_meta['cutoff_date']}  ({abs(days)} days PAST cutoff)")
+        snap_word = "snapshot" if self._current_fy_meta["gstr2a_snapshot_count"] == 1 else "snapshots"
+        cutoff_text = (f"({days} days remaining)" if days >= 0 else f"({abs(days)} days PAST cutoff)")
+        self.recon_cutoff_var.set(
+            f"Late-filing cutoff: {self._current_fy_meta['cutoff_date']}  {cutoff_text}   |   "
+            f"GSTR-2A data merged from {self._current_fy_meta['gstr2a_snapshot_count']} {snap_word} "
+            f"(most recent uploaded {self._current_fy_meta['gstr2a_latest_uploaded_at']})"
+        )
         self._render_category()
 
     def _render_category(self):
@@ -655,8 +641,7 @@ class App(tk.Tk):
         if not path:
             return
         try:
-            service.export_fy_reconciliation(self.current_client_id, fy_label, path,
-                                              snapshot_id=self._current_snapshot_id)
+            service.export_fy_reconciliation(self.current_client_id, fy_label, path)
         except Exception as e:
             messagebox.showerror("Export failed", f"{e}\n\n{traceback.format_exc()[-800:]}")
             return

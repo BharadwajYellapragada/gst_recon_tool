@@ -85,8 +85,10 @@ def build_report(client_name, client_gstin, snapshot_info, purchase_asof, result
                     f"against GSTR-2A periods {fy_meta['period_window_display']} "
                     f"({fy_meta['late_filing_months']}-month late-filing allowance)")
         ws["B4"].font = SUB_FONT
-        ws["B5"] = (f"GSTR-2A snapshot uploaded {fy_meta['snapshot_uploaded_at']} "
-                    f"(portal generation date: {fy_meta['snapshot_generation_date'] or 'n/a'})")
+        snap_word = "snapshot" if fy_meta["gstr2a_snapshot_count"] == 1 else "snapshots"
+        ws["B5"] = (f"GSTR-2A data merged from {fy_meta['gstr2a_snapshot_count']} portal {snap_word} "
+                    f"(most recent uploaded {fy_meta['gstr2a_latest_uploaded_at']}, "
+                    f"portal generation date: {fy_meta['gstr2a_latest_generation_date'] or 'n/a'})")
         ws["B5"].font = SUB_FONT
         cutoff_note = (f"Late-filing cutoff for this FY: {fy_meta['cutoff_date']}"
                        + (f"  \u2014  {fy_meta['days_until_cutoff']} days remaining" if fy_meta['days_until_cutoff'] >= 0

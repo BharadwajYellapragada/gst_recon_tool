@@ -333,6 +333,43 @@ def get_snapshot_invoices(snapshot_id):
     )
 
 
+def get_merged_gstr2a_invoices(client_id, period_window):
+    """
+    Merges every GSTR-2A snapshot ever uploaded for this client into a single
+    de-duplicated view for reconciliation, so the user doesn't have to manually
+    pick one snapshot. Each portal download is cumulative (a filed invoice keeps
+    reappearing in every later download), so the same (GSTIN+invoice, rate) line
+    reappearing across snapshots is not new data -- for each such line, only the
+    row from the most-recently-uploaded snapshot that contains it is kept. This
+    also means a supplier's amended figures in a later download automatically
+    take precedence over stale ones from an earlier download, with no manual
+    overwrite/ignore step needed (unlike Purchase Register conflicts, both sides
+    here come from the same authority -- the GST portal -- just captured at
+    different times, so "most recent" is always the right answer).
+
+    True duplicate / multi-rate-split rows *within* a single snapshot are left
+    untouched -- reconcile.py's own multi-rate detection still runs on whatever
+    this returns.
+    """
+    import pandas as pd
+    df = pd.read_sql_query(
+        """SELECT gi.*, gs.uploaded_at AS snap_uploaded_at
+           FROM gstr2a_invoices gi
+           JOIN gstr2a_snapshots gs ON gs.snapshot_id = gi.snapshot_id
+           WHERE gi.client_id=?""",
+        get_conn(), params=(client_id,),
+    )
+    if len(df) == 0:
+        return df.drop(columns=["snap_uploaded_at"], errors="ignore")
+    df = df[df["period"].isin(period_window)].copy()
+    if len(df) == 0:
+        return df.drop(columns=["snap_uploaded_at"], errors="ignore")
+
+    latest = df.groupby(["match_key", "rate"])["snap_uploaded_at"].transform("max")
+    df = df[df["snap_uploaded_at"] == latest]
+    return df.drop(columns=["snap_uploaded_at"])
+
+
 # ---------------- Purchase Register operations ----------------
 
 def add_purchase_batch(client_id, source_filename, entries):
