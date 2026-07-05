@@ -51,6 +51,12 @@ def _verify(activation_key, fingerprint):
         sig = base64.urlsafe_b64decode(cleaned + "=" * (-len(cleaned) % 4))
     except Exception:
         return False
+    # Reject non-canonical encodings: a 64-byte signature's last base64 char
+    # has unused low bits that a permissive decoder ignores, so more than one
+    # text string can decode to the same bytes. Re-encoding and comparing
+    # ensures only the exact, canonical key text we issued is accepted.
+    if base64.urlsafe_b64encode(sig).decode("ascii").rstrip("=") != cleaned:
+        return False
     pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(VENDOR_PUBLIC_KEY_HEX))
     try:
         pub.verify(sig, fingerprint.encode("utf-8"))
