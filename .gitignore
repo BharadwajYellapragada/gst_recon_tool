@@ -5,4 +5,7 @@
 build/
 dist/
 *.spec
+installer_output/*
+!installer_output/README.txt
+vendor_tools/vendor_private_key.pem
 

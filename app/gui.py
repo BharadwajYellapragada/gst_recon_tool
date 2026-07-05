@@ -15,7 +15,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 
-from . import db, parsers, reconcile, report, service, security
+from . import db, parsers, reconcile, report, service, security, licensing
 
 APP_TITLE = "GST Reconciliation Tool"
 
@@ -50,6 +50,67 @@ def open_file(path):
             subprocess.Popen(["xdg-open", path])
     except Exception as e:
         messagebox.showerror("Could not open file", str(e))
+
+
+class ActivationScreen(tk.Tk):
+    """Shown before anything else, on every machine that hasn't been activated
+    yet. Displays this machine's fingerprint (to send to the vendor) and takes
+    the activation key the vendor issues for it -- see app/licensing.py."""
+
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("560x400")
+        self.resizable(False, False)
+        set_app_icon(self)
+        self.activated = False
+
+        frame = ttk.Frame(self, padding=24)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Activate " + APP_TITLE, font=("Arial", 14, "bold")).pack(anchor="w")
+        ttk.Label(frame, text="This copy of the app hasn't been activated on this computer yet. "
+                              "Send the machine ID below to whoever gave you this software; they'll "
+                              "send back an activation key to paste in below.",
+                  foreground="#595959", wraplength=500, justify="left").pack(anchor="w", pady=(6, 16))
+
+        ttk.Label(frame, text="This computer's Machine ID").pack(anchor="w")
+        fp_row = ttk.Frame(frame)
+        fp_row.pack(fill="x", pady=(2, 16))
+        self.fp_var = tk.StringVar(value=licensing.current_fingerprint())
+        fp_entry = ttk.Entry(fp_row, textvariable=self.fp_var, state="readonly")
+        fp_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(fp_row, text="Copy", command=self._copy_fingerprint).pack(side="left", padx=(6, 0))
+
+        ttk.Label(frame, text="Activation Key").pack(anchor="w")
+        self.key_var = tk.StringVar()
+        key_entry = ttk.Entry(frame, textvariable=self.key_var)
+        key_entry.pack(fill="x", pady=(2, 10))
+        key_entry.bind("<Return>", lambda e: self._submit())
+        key_entry.focus_set()
+
+        self.error_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.error_var, foreground="#9C0006", wraplength=500,
+                  justify="left").pack(anchor="w", pady=(0, 8))
+
+        ttk.Button(frame, text="Activate", command=self._submit).pack(anchor="e")
+
+    def _copy_fingerprint(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.fp_var.get())
+
+    def _submit(self):
+        key = self.key_var.get().strip()
+        if not key:
+            self.error_var.set("Paste the activation key you were given.")
+            return
+        try:
+            licensing.activate(key)
+        except licensing.LicenseError as e:
+            self.error_var.set(str(e))
+            return
+        self.activated = True
+        self.destroy()
 
 
 class LoginScreen(tk.Tk):
@@ -704,6 +765,12 @@ class App(tk.Tk):
 
 
 def main():
+    if not licensing.is_activated():
+        activation = ActivationScreen()
+        activation.mainloop()
+        if not activation.activated:
+            return
+
     login = LoginScreen()
     login.mainloop()
     if not login.unlocked:
