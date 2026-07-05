@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GST Reconciliation Tool</title>
+<style>
+  :root {
+    --navy: #163a5c;
+    --navy-dark: #0f2942;
+    --accent: #6eb4e0;
+    --text: #1a2733;
+    --muted: #5b6b78;
+    --bg: #f4f7fa;
+    --card: #ffffff;
+    --border: #e1e8ee;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 24px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    max-width: 480px;
+    width: 100%;
+    padding: 40px 36px;
+    box-shadow: 0 2px 8px rgba(15, 41, 66, 0.06);
+  }
+  .icon {
+    width: 64px;
+    height: 64px;
+    border-radius: 16px;
+    background: var(--navy);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 20px;
+  }
+  .icon svg { width: 34px; height: 34px; }
+  h1 {
+    font-size: 22px;
+    margin: 0 0 8px;
+    color: var(--navy-dark);
+  }
+  p.sub {
+    color: var(--muted);
+    margin: 0 0 28px;
+    line-height: 1.5;
+    font-size: 14.5px;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--navy);
+    color: #fff;
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 15px;
+    padding: 13px 22px;
+    border-radius: 10px;
+    transition: background 0.15s ease;
+  }
+  .btn:hover { background: var(--navy-dark); }
+  .meta {
+    margin-top: 18px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .steps {
+    margin-top: 32px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+  }
+  .steps h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin: 0 0 12px;
+  }
+  .steps ol {
+    margin: 0;
+    padding-left: 20px;
+    font-size: 14px;
+    line-height: 1.7;
+    color: var(--text);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1620;
+      --card: #16212c;
+      --border: #253340;
+      --text: #e6edf3;
+      --muted: #93a1ac;
+      --navy: #2f6690;
+      --navy-dark: #6eb4e0;
+    }
+    .btn { color: #0e1620; }
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">
+      <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M3 12.5L8 17L21 4" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </div>
+    <h1>GST Reconciliation Tool</h1>
+    <p class="sub">Reconcile GSTR-2A against your Purchase Register, track late filers, and export ready-to-use Excel reports &mdash; for Windows.</p>
+
+    <a class="btn" href="https://github.com/BharadwajYellapragada/gst_recon_tool/releases/latest/download/GST-Reconciliation-Tool-Setup.exe" download>
+      Download for Windows
+    </a>
+    <div class="meta">Windows 10/11 &middot; no Python required &middot; ~33 MB installer</div>
+
+    <div class="steps">
+      <h2>After installing</h2>
+      <ol>
+        <li>Run the installer (Windows may show an "unknown publisher" warning &mdash; click "More info" &rarr; "Run anyway").</li>
+        <li>On first launch, the app shows a Machine ID &mdash; send it to whoever gave you this software.</li>
+        <li>They'll send back an Activation Key. Paste it in to unlock the app on your computer.</li>
+        <li>Set a PIN on first run &mdash; required every time you open the app.</li>
+      </ol>
+    </div>
+  </div>
+</body>
+</html>
