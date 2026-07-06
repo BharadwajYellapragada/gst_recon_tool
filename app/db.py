@@ -522,6 +522,31 @@ def get_all_purchase_entries(client_id):
     )
 
 
+def get_purchase_entries_by_batch(batch_id):
+    import pandas as pd
+    return pd.read_sql_query(
+        "SELECT * FROM purchase_entries WHERE batch_id=?", get_conn(), params=(batch_id,)
+    )
+
+
+def delete_purchase_batch(batch_id):
+    """Removes an upload batch and every row it added, freeing their row_hash
+    values so the same file can be re-uploaded cleanly afterwards."""
+    conn = get_conn()
+    conn.execute("DELETE FROM purchase_entries WHERE batch_id=?", (batch_id,))
+    conn.execute("DELETE FROM purchase_batches WHERE batch_id=?", (batch_id,))
+    conn.commit()
+    persist()
+
+
+def delete_gstr2a_snapshot(snapshot_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM gstr2a_invoices WHERE snapshot_id=?", (snapshot_id,))
+    conn.execute("DELETE FROM gstr2a_snapshots WHERE snapshot_id=?", (snapshot_id,))
+    conn.commit()
+    persist()
+
+
 def list_available_fys(client_id):
     """Distinct financial years present in this client's stored (active) Purchase
     Register data, most recent first."""

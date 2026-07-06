@@ -473,12 +473,12 @@ class App(tk.Tk):
 
     def _build_upload_tab(self):
         t = self.tab_upload
-        ttk.Label(t, text="Step 1 — Upload the GSTR-2A file downloaded from the GST portal",
+        ttk.Label(t, text="Step 1 — Upload the GSTR-2A/2B file downloaded from the GST portal",
                   font=("Arial", 10, "bold")).pack(anchor="w")
         ttk.Label(t, text="Each upload is kept as a dated snapshot — nothing is overwritten, "
                           "so you can track suppliers filing late over the following months.",
                   foreground="#595959").pack(anchor="w", pady=(0, 6))
-        self.upload_g2a_btn = ttk.Button(t, text="Select GSTR-2A file(s) (.xls/.xlsx)...",
+        self.upload_g2a_btn = ttk.Button(t, text="Select GSTR-2A/2B file(s) (.xls/.xlsx)...",
                                           command=self._upload_gstr2a, state="disabled")
         self.upload_g2a_btn.pack(anchor="w", pady=(0, 16))
 
@@ -591,13 +591,17 @@ class App(tk.Tk):
 
     def _build_history_tab(self):
         t = self.tab_history
-        ttk.Label(t, text="GSTR-2A Snapshots", font=("Arial", 10, "bold")).pack(anchor="w")
+        ttk.Label(t, text="GSTR-2A/2B Snapshots", font=("Arial", 10, "bold")).pack(anchor="w")
         cols = ("Uploaded", "File", "Portal Generation Date", "Periods", "Invoices")
         self.snap_tree = ttk.Treeview(t, columns=cols, show="headings", height=8)
         for c in cols:
             self.snap_tree.heading(c, text=c)
             self.snap_tree.column(c, width=180 if c != "Invoices" else 80, anchor="w")
-        self.snap_tree.pack(fill="x", pady=(4, 16))
+        self.snap_tree.pack(fill="x", pady=(4, 0))
+        snap_btns = ttk.Frame(t)
+        snap_btns.pack(fill="x", pady=(4, 16))
+        ttk.Button(snap_btns, text="Download Selected...", command=self._download_snapshot).pack(side="left")
+        ttk.Button(snap_btns, text="Delete Selected", command=self._delete_snapshot).pack(side="left", padx=6)
 
         ttk.Label(t, text="Purchase Register Upload Batches", font=("Arial", 10, "bold")).pack(anchor="w")
         cols2 = ("Uploaded", "File", "Rows in File", "New", "Skipped (dup)", "Pending Conflicts")
@@ -606,22 +610,100 @@ class App(tk.Tk):
             self.batch_tree.heading(c, text=c)
             self.batch_tree.column(c, width=150, anchor="w")
         self.batch_tree.pack(fill="both", expand=True, pady=(4, 0))
+        batch_btns = ttk.Frame(t)
+        batch_btns.pack(fill="x", pady=(4, 0))
+        ttk.Button(batch_btns, text="Download Selected...", command=self._download_batch).pack(side="left")
+        ttk.Button(batch_btns, text="Delete Selected", command=self._delete_batch).pack(side="left", padx=6)
 
     def _refresh_history_tab(self):
         if not self.current_client_id:
             return
         self.snap_tree.delete(*self.snap_tree.get_children())
         for s in db.list_snapshots(self.current_client_id):
-            self.snap_tree.insert("", "end", values=(
+            self.snap_tree.insert("", "end", iid=str(s["snapshot_id"]), values=(
                 s["uploaded_at"], s["source_filename"], s["generation_date"] or "n/a",
                 f"{s['period_min']}–{s['period_max']}", s["row_count"],
             ))
         self.batch_tree.delete(*self.batch_tree.get_children())
         for b in db.list_purchase_batches(self.current_client_id):
-            self.batch_tree.insert("", "end", values=(
+            self.batch_tree.insert("", "end", iid=str(b["batch_id"]), values=(
                 b["uploaded_at"], b["source_filename"], b["row_count"], b["new_rows"],
                 b["duplicate_rows_skipped"], b["conflict_rows"],
             ))
+
+    def _download_snapshot(self):
+        sel = self.snap_tree.selection()
+        if not sel:
+            messagebox.showwarning("Nothing selected", "Select a snapshot first.")
+            return
+        snapshot_id = int(sel[0])
+        default_name = f"GSTR2A_2B_snapshot_{snapshot_id}.xlsx"
+        path = filedialog.asksaveasfilename(
+            title="Save snapshot as", initialfile=default_name,
+            defaultextension=".xlsx", filetypes=[("Excel workbook", "*.xlsx")],
+        )
+        if not path:
+            return
+        try:
+            service.export_gstr2a_snapshot(snapshot_id, path)
+        except Exception as e:
+            messagebox.showerror("Download failed", f"{e}\n\n{traceback.format_exc()[-800:]}")
+            return
+        if messagebox.askyesno("Saved", f"Saved to:\n{path}\n\nOpen it now?"):
+            open_file(path)
+
+    def _delete_snapshot(self):
+        sel = self.snap_tree.selection()
+        if not sel:
+            messagebox.showwarning("Nothing selected", "Select a snapshot first.")
+            return
+        snapshot_id = int(sel[0])
+        if not messagebox.askyesno(
+            "Delete snapshot",
+            "This removes this snapshot and all its invoice rows from this client's data. "
+            "This cannot be undone (though you can re-upload the same file afterwards). Continue?",
+        ):
+            return
+        db.delete_gstr2a_snapshot(snapshot_id)
+        self._refresh_history_tab()
+        self._refresh_recon_tab()
+
+    def _download_batch(self):
+        sel = self.batch_tree.selection()
+        if not sel:
+            messagebox.showwarning("Nothing selected", "Select an upload batch first.")
+            return
+        batch_id = int(sel[0])
+        default_name = f"PurchaseRegister_batch_{batch_id}.xlsx"
+        path = filedialog.asksaveasfilename(
+            title="Save batch as", initialfile=default_name,
+            defaultextension=".xlsx", filetypes=[("Excel workbook", "*.xlsx")],
+        )
+        if not path:
+            return
+        try:
+            service.export_purchase_batch(batch_id, path)
+        except Exception as e:
+            messagebox.showerror("Download failed", f"{e}\n\n{traceback.format_exc()[-800:]}")
+            return
+        if messagebox.askyesno("Saved", f"Saved to:\n{path}\n\nOpen it now?"):
+            open_file(path)
+
+    def _delete_batch(self):
+        sel = self.batch_tree.selection()
+        if not sel:
+            messagebox.showwarning("Nothing selected", "Select an upload batch first.")
+            return
+        batch_id = int(sel[0])
+        if not messagebox.askyesno(
+            "Delete upload batch",
+            "This removes every Purchase Register row this upload added from this client's data. "
+            "This cannot be undone (though you can re-upload the same file afterwards). Continue?",
+        ):
+            return
+        db.delete_purchase_batch(batch_id)
+        self._refresh_history_tab()
+        self._refresh_recon_tab()
 
     # ---------------- Reconciliation tab ----------------
 

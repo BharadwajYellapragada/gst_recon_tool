@@ -112,3 +112,41 @@ def export_purchase_month(client_id, year_month, output_path):
     })
     out.to_excel(output_path, index=False)
     return output_path
+
+
+def export_purchase_batch(batch_id, output_path):
+    """Exports every row a single Purchase Register upload added, as a plain Excel sheet
+    — since the originally uploaded file itself isn't kept, this re-derives an equivalent
+    file from what was stored, for a user who wants a copy of what an upload batch contains."""
+    df = db.get_purchase_entries_by_batch(batch_id)
+    if len(df) == 0:
+        raise ValueError("No entries found for this upload batch.")
+    cols = ["entry_date", "particulars", "invoice_no", "invoice_date", "gstin",
+            "gross_total", "cgst", "sgst", "igst"]
+    out = df[cols].rename(columns={
+        "entry_date": "Date", "particulars": "Particulars", "invoice_no": "Supplier Invoice No.",
+        "invoice_date": "Supplier Invoice Date", "gstin": "GSTIN/UIN", "gross_total": "Gross Total",
+        "cgst": "CGST", "sgst": "SGST", "igst": "IGST",
+    })
+    out.to_excel(output_path, index=False)
+    return output_path
+
+
+def export_gstr2a_snapshot(snapshot_id, output_path):
+    """Exports a GSTR-2A/2B snapshot's stored invoices as a plain Excel sheet — a
+    re-derived copy (the originally uploaded portal file itself isn't kept)."""
+    df = db.get_snapshot_invoices(snapshot_id)
+    if len(df) == 0:
+        raise ValueError("No invoices found for this snapshot.")
+    cols = ["period", "gstin", "supplier_name", "invoice_no", "invoice_date", "invoice_value",
+            "rate", "taxable_value", "igst", "cgst", "sgst", "cess", "filing_date",
+            "itc_available", "reason"]
+    out = df[cols].rename(columns={
+        "period": "Period", "gstin": "GSTIN", "supplier_name": "Supplier Name",
+        "invoice_no": "Invoice No", "invoice_date": "Invoice Date", "invoice_value": "Invoice Value",
+        "rate": "Rate", "taxable_value": "Taxable Value", "igst": "IGST", "cgst": "CGST",
+        "sgst": "SGST", "cess": "Cess", "filing_date": "Filing Date",
+        "itc_available": "ITC Available", "reason": "Reason",
+    })
+    out.to_excel(output_path, index=False)
+    return output_path

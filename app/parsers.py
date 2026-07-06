@@ -25,8 +25,42 @@ def _norm_inv(x):
     return re.sub(r'[^A-Z0-9]', '', x)
 
 
+_PERIOD_RE = re.compile(r"([A-Za-z]{3,})[^0-9]*?(\d{2,4})")
+
+
+def _normalize_period(s):
+    """Canonicalizes the B2B sheet's period value to 'MMM-YY' (matching
+    fy_utils.period_str), since GSTR-2A spells it 'APR-22' but GSTR-2B spells
+    the same thing "Apr'25" — without this, FY-window filtering would silently
+    exclude every GSTR-2B row from reconciliation."""
+    s = str(s or "").strip()
+    m = _PERIOD_RE.search(s)
+    if not m:
+        return s
+    return f"{m.group(1)[:3].upper()}-{m.group(2)[-2:]}"
+
+
 def _num(x):
     return x if isinstance(x, (int, float)) else 0
+
+
+def _normalize_header(s):
+    """Strips whitespace/newlines/currency symbols/punctuation so headers like
+    'Taxable value (₹)' and 'Taxable Value (₹)' both become 'taxablevalue'."""
+    return re.sub(r'[^a-z0-9]', '', str(s or "").lower())
+
+
+def _combine_header_rows(row1, row2):
+    """The B2B sheet's header spans two rows: a group header (e.g. 'Invoice details')
+    whose sub-columns are named on the row below (e.g. 'Invoice number'). The
+    sub-header is more specific, so it wins wherever present."""
+    n = max(len(row1), len(row2))
+    out = []
+    for i in range(n):
+        v2 = row2[i] if i < len(row2) else None
+        v1 = row1[i] if i < len(row1) else None
+        out.append(v2 if v2 not in (None, "") else v1)
+    return out
 
 
 def _open_book(path):
@@ -43,14 +77,20 @@ def parse_gstr2a(path):
     Returns (invoices_df, generation_date_str).
     invoices_df has columns G2A_COLS + MatchKey, GSTIN uppercased.
     Raises ParseError with a user-facing message on bad file.
+
+    Handles both GSTR-2A exports (Table 8A style, 'Period' as the first B2B
+    column) and GSTR-2B exports (no leading Period column; several extra
+    columns like IRN/Source) by locating each field by its header text
+    instead of a fixed column position — the two reports don't share a
+    column layout even though both use a 'B2B' sheet name.
     """
     kind, wb = _open_book(path)
     sheet_names = wb.sheet_names() if kind == "xlrd" else wb.sheetnames
     if "B2B" not in sheet_names:
         raise ParseError(
-            "This doesn't look like a GSTR-2A export — no 'B2B' sheet found. "
+            "This doesn't look like a GSTR-2A/2B export — no 'B2B' sheet found. "
             "Please upload the .xls/.xlsx file downloaded from the GST portal's "
-            "'Download GSTR-2A' option."
+            "'Download GSTR-2A' or 'Download GSTR-2B' option."
         )
 
     generation_date = ""
@@ -58,27 +98,96 @@ def parse_gstr2a(path):
         try:
             if kind == "xlrd":
                 rm = wb.sheet_by_name("Read me")
-                for r in range(min(10, rm.nrows)):
-                    row = rm.row_values(r)
-                    if len(row) > 3 and "generation" in str(row[3]).lower():
-                        generation_date = str(row[4])
+                rm_rows = [rm.row_values(r) for r in range(min(15, rm.nrows))]
             else:
                 rm = wb["Read me"]
-                for row in rm.iter_rows(min_row=1, max_row=10, values_only=True):
-                    for i, cell in enumerate(row):
-                        if cell and "generation" in str(cell).lower() and i + 1 < len(row):
-                            generation_date = str(row[i + 1])
+                rm_rows = [list(r) for r in rm.iter_rows(min_row=1, max_row=15, values_only=True)]
+            for row in rm_rows:
+                for i, cell in enumerate(row):
+                    if cell and "generation" in str(cell).lower():
+                        # The value sits 1 or 2 cells to the right depending on
+                        # the report (GSTR-2A vs 2B lay out this sheet differently).
+                        for offset in (1, 2):
+                            if i + offset < len(row) and row[i + offset]:
+                                generation_date = str(row[i + offset])
+                                break
+                    if generation_date:
+                        break
+                if generation_date:
+                    break
         except Exception:
             pass
 
     if kind == "xlrd":
         ws = wb.sheet_by_name("B2B")
-        rows = [ws.row_values(r) for r in range(6, ws.nrows)]
+        all_rows = [ws.row_values(r) for r in range(ws.nrows)]
     else:
         ws = wb["B2B"]
-        rows = [list(r) for r in ws.iter_rows(min_row=7, values_only=True)]
+        all_rows = [list(r) for r in ws.iter_rows(values_only=True)]
 
-    rows = [r[:18] for r in rows if r and str(r[1] if len(r) > 1 else "").strip()]
+    # Locate the two-row header by its anchor column ('GSTIN of supplier') rather
+    # than assuming a fixed row number.
+    header_row_idx = None
+    for i, row in enumerate(all_rows[:20]):
+        cells = [_normalize_header(c) for c in row if c is not None]
+        if any(c == "gstinofsupplier" for c in cells):
+            header_row_idx = i
+            break
+    if header_row_idx is None or header_row_idx + 1 >= len(all_rows):
+        raise ParseError(
+            "Could not find the header row (expected a 'GSTIN of supplier' column) in the "
+            "B2B sheet. This file's layout doesn't match a recognised GSTR-2A/2B export."
+        )
+
+    header = _combine_header_rows(all_rows[header_row_idx], all_rows[header_row_idx + 1])
+    norm_header = [_normalize_header(h) for h in header]
+
+    def find_col(*keywords):
+        for i, h in enumerate(norm_header):
+            if all(kw in h for kw in keywords):
+                return i
+        return None
+
+    col_map = {
+        "Period": find_col("period"),
+        "GSTIN": find_col("gstin"),
+        "SupplierName": find_col("legal"),
+        "InvoiceNo": find_col("invoice", "number"),
+        "InvoiceType": find_col("invoice", "type"),
+        "InvoiceDate": find_col("invoice", "date"),
+        "InvoiceValue": find_col("invoice", "value"),
+        "PlaceOfSupply": find_col("place", "supply"),
+        "RCM": find_col("reverse", "charge"),
+        "Rate": find_col("rate"),
+        "TaxableValue": find_col("taxable", "value"),
+        "IGST": find_col("integrated", "tax"),
+        "CGST": find_col("central", "tax"),
+        "SGST": find_col("state", "tax"),
+        "Cess": find_col("cess"),
+        "FilingDate": find_col("filing", "date"),
+        "ITCAvailable": find_col("itc"),
+        "Reason": find_col("reason"),
+    }
+    required = ["Period", "GSTIN", "InvoiceNo", "InvoiceDate", "InvoiceValue",
+                "TaxableValue", "IGST", "CGST", "SGST"]
+    missing = [k for k in required if col_map[k] is None]
+    if missing:
+        raise ParseError(
+            f"Could not find expected column(s) {', '.join(missing)} in the B2B sheet. "
+            "This file's layout doesn't match a recognised GSTR-2A/2B export."
+        )
+
+    data_rows = all_rows[header_row_idx + 2:]
+    rows = []
+    for r in data_rows:
+        if not r:
+            continue
+        i_gstin = col_map["GSTIN"]
+        if i_gstin >= len(r) or not str(r[i_gstin] or "").strip():
+            continue
+        rows.append([r[col_map[c]] if col_map[c] is not None and col_map[c] < len(r) else None
+                     for c in G2A_COLS])
+
     if not rows:
         raise ParseError("No invoice rows found in the B2B sheet. The file may be empty or in an unexpected format.")
 
@@ -88,6 +197,7 @@ def parse_gstr2a(path):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     df["GSTIN"] = df["GSTIN"].astype(str).str.strip().str.upper()
     df["InvoiceNo"] = df["InvoiceNo"].astype(str).str.strip()
+    df["Period"] = df["Period"].apply(_normalize_period)
     df["MatchKey"] = df["GSTIN"] + "|" + df["InvoiceNo"].apply(_norm_inv)
     return df, generation_date
 
