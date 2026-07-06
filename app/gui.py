@@ -16,6 +16,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 
+import pandas as pd
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
@@ -57,6 +58,19 @@ def format_inr(value, decimals=0):
         int_part = ",".join(groups) + "," + last3
     out = f"₹{int_part}" + (f".{dec_part}" if dec_part else "")
     return f"-{out}" if neg else out
+
+
+def _style_axes(ax):
+    """Shared chart chrome (recessive spines/gridlines/ticks) used by every
+    matplotlib Axes in the app — the live Insights tab and the past-report
+    viewer both draw the same three chart kinds and should look identical."""
+    ax.set_facecolor(CHART_SURFACE)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    for spine in ("left", "bottom"):
+        ax.spines[spine].set_color(CHART_MUTED)
+    ax.tick_params(colors=CHART_MUTED, labelsize=8)
+    ax.title.set_color(CHART_INK)
 
 
 def format_inr_short(value):
@@ -517,6 +531,202 @@ class ConflictResolutionDialog(tk.Toplevel):
         self.destroy()
         if self.on_close:
             self.on_close()
+
+
+# Sheet names report.py writes, in the order the picker should offer them
+# (Summary is deliberately excluded — it's freeform letterhead text, not a table).
+_REPORT_SHEET_ORDER = ["Value_Tax_Mismatches", "Probable_Matches", "Only_In_GSTR2A",
+                       "Only_In_PurchaseRegister", "Duplicates_GSTR2A", "MultiRate_Reference",
+                       "Matched_Clean", "Pending_Conflicts"]
+
+
+def _safe_sum(df, col):
+    if df is None or col not in df.columns:
+        return 0
+    return pd.to_numeric(df[col], errors="coerce").fillna(0).sum()
+
+
+def _safe_count(df, required_col=None):
+    if df is None or (required_col is not None and required_col not in df.columns):
+        return 0
+    return len(df)
+
+
+def _load_report_sheets(path):
+    """Reads back report.py's per-category sheets as clean DataFrames.
+
+    The header isn't always row 1: several sheets have a note row written
+    above the real header (Probable_Matches always; Only_In_PurchaseRegister
+    and Pending_Conflicts only in certain data-dependent cases, e.g. report.py
+    calls ws.insert_rows(1) for Only_In_PurchaseRegister only when a
+    'past_6_month_window' column is present). Rather than hardcode a per-sheet
+    offset that would silently break if report.py's layout shifts again, the
+    header row is located by content: a real header is several short text
+    cells; a note is one long sentence alone in column A, and a blank spacer
+    row has nothing at all — both fail the "is this a header row" test below.
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    result = {}
+    for name in _REPORT_SHEET_ORDER:
+        if name not in wb.sheetnames:
+            continue
+        ws = wb[name]
+        rows = list(ws.iter_rows(max_row=10, values_only=True))
+        header_idx = None
+        for i, row in enumerate(rows):
+            non_null = [c for c in row if c not in (None, "")]
+            if len(non_null) >= 3 and all(isinstance(c, str) and len(c) < 40 for c in non_null):
+                header_idx = i
+                break
+        if header_idx is None:
+            result[name] = pd.DataFrame()  # placeholder-message sheet, e.g. "No rows found..."
+            continue
+        header = [str(c) if c is not None else "" for c in rows[header_idx]]
+        data_rows = [list(r[:len(header)]) for r in ws.iter_rows(min_row=header_idx + 2, values_only=True)
+                     if any(c is not None for c in r)]
+        result[name] = pd.DataFrame(data_rows, columns=header)
+    return result
+
+
+class ReportViewerWindow(tk.Toplevel):
+    """Reopens an already-exported reconciliation report (.xlsx) in the same
+    Category Details / Insights layout as a live run — since the original
+    upload data may since have changed (new uploads, deletions), this reads
+    back the frozen numbers from the saved file itself rather than re-running
+    reconciliation, so it always matches exactly what was actually reported."""
+
+    def __init__(self, parent, report_path):
+        super().__init__(parent)
+        self.report_path = report_path
+        self.title(f"Report — {os.path.basename(report_path)}")
+        self.geometry("1300x820")
+        self.transient(parent)
+        set_app_icon(self)
+
+        try:
+            self.sheets = _load_report_sheets(report_path)
+        except Exception as e:
+            ttk.Label(self, text=f"Could not read this report file:\n{e}",
+                      style="Error.TLabel", padding=20).pack(anchor="w")
+            return
+
+        ttk.Label(self, text=os.path.basename(report_path), style="Header.TLabel",
+                  padding=(12, 12, 12, 0)).pack(anchor="w")
+
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True, padx=12, pady=12)
+        details_tab = ttk.Frame(notebook, padding=(0, 10))
+        insights_tab = ttk.Frame(notebook, padding=(0, 10))
+        notebook.add(details_tab, text="Category Details")
+        notebook.add(insights_tab, text="Insights")
+
+        self._build_details(details_tab)
+        self._build_insights(insights_tab)
+
+    def _build_details(self, t):
+        available = [s for s in _REPORT_SHEET_ORDER if s in self.sheets]
+        filt = ttk.Frame(t)
+        filt.pack(fill="x", pady=(0, 8))
+        ttk.Label(filt, text="View category:").pack(side="left")
+        self.sheet_var = tk.StringVar(value=available[0] if available else "")
+        sheet_combo = ttk.Combobox(filt, textvariable=self.sheet_var, state="readonly",
+                                    width=32, values=available)
+        sheet_combo.pack(side="left", padx=8)
+        sheet_combo.bind("<<ComboboxSelected>>", lambda e: self._render_sheet())
+
+        result_container, self.result_tree = _make_scrollable_tree(t, (), height=20)
+        result_container.pack(fill="both", expand=True)
+        self._render_sheet()
+
+    def _render_sheet(self):
+        self.result_tree.delete(*self.result_tree.get_children())
+        self.result_tree["columns"] = ()
+        name = self.sheet_var.get()
+        df = self.sheets.get(name)
+        if df is None or len(df) == 0:
+            self.result_tree["columns"] = ("info",)
+            self.result_tree.heading("info", text="Result")
+            self.result_tree.insert("", "end", values=("No rows in this category.",))
+            return
+        cols = list(df.columns)[:17]
+        self.result_tree["columns"] = cols
+        for c in cols:
+            self.result_tree.heading(c, text=c)
+            self.result_tree.column(c, width=_col_width(c), anchor="w")
+        for _, row in df.head(500).iterrows():
+            self.result_tree.insert("", "end", values=[row[c] for c in cols])
+
+    def _build_insights(self, t):
+        kpi_row = ttk.Frame(t)
+        kpi_row.pack(fill="x", pady=(0, 16))
+        matched_value = _safe_sum(self.sheets.get("Matched_Clean"), "Invoice Value")
+        itc_at_risk = _safe_sum(self.sheets.get("Only_In_PurchaseRegister"), "Gross Total")
+        mismatch_value = _safe_sum(self.sheets.get("Value_Tax_Mismatches"), "Diff_Value")
+        if isinstance(mismatch_value, (int, float)):
+            mismatch_value = abs(mismatch_value)
+        for i, (label, val) in enumerate([
+            ("Matched Value", matched_value),
+            ("ITC at Risk (Only in Books)", itc_at_risk),
+            ("Mismatch Value (abs)", mismatch_value),
+        ]):
+            tile = ttk.Frame(kpi_row, relief="solid", borderwidth=1, padding=14)
+            tile.pack(side="left", fill="both", expand=True, padx=(0 if i == 0 else 10, 0))
+            ttk.Label(tile, text=format_inr(val), font=(UI_FONT, 18, "bold")).pack(anchor="w")
+            ttk.Label(tile, text=label, style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
+
+        scroll_container, charts_area = _make_scrollable_frame(t)
+        scroll_container.pack(fill="both", expand=True)
+
+        labels = ["Matched\nClean", "Value/Tax\nMismatches", "Probable\nMatches",
+                  "Only in\nGSTR-2A", "Only in\nBooks", "Pending\nConflicts"]
+        values = [
+            _safe_count(self.sheets.get("Matched_Clean"), "Invoice No"),
+            _safe_count(self.sheets.get("Value_Tax_Mismatches"), "GSTIN"),
+            _safe_count(self.sheets.get("Probable_Matches"), "GSTIN"),
+            _safe_count(self.sheets.get("Only_In_GSTR2A"), "GSTIN"),
+            _safe_count(self.sheets.get("Only_In_PurchaseRegister"), "GSTIN"),
+            _safe_count(self.sheets.get("Pending_Conflicts"), "GSTIN"),
+        ]
+        fig1 = Figure(figsize=(10.5, 3.2), dpi=96, facecolor=CHART_SURFACE)
+        ax1 = fig1.add_subplot(111)
+        bars = ax1.bar(labels, values, color=CHART_CATEGORICAL, width=0.6)
+        for bar, val in zip(bars, values):
+            ax1.annotate(str(val), (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                         ha="center", va="bottom", fontsize=8, color=CHART_INK)
+        ax1.set_title("Reconciliation Categories", fontsize=10, fontweight="bold", loc="left")
+        ax1.grid(axis="y", color=CHART_GRID, linewidth=0.8)
+        ax1.set_axisbelow(True)
+        _style_axes(ax1)
+        fig1.tight_layout()
+        canvas1 = FigureCanvasTkAgg(fig1, master=charts_area)
+        canvas1.get_tk_widget().pack(fill="both", expand=True, pady=(0, 16))
+        canvas1.draw()
+
+        fig2 = Figure(figsize=(10.5, 4.6), dpi=96, facecolor=CHART_SURFACE)
+        ax2 = fig2.add_subplot(111)
+        only_pr = self.sheets.get("Only_In_PurchaseRegister")
+        if only_pr is not None and "Supplier Name" in only_pr.columns and "Gross Total" in only_pr.columns:
+            top = only_pr.groupby("Supplier Name")["Gross Total"].sum().sort_values(ascending=False).head(8)
+            top = top.sort_values(ascending=True)
+            names = [n if len(str(n)) <= 24 else str(n)[:21] + "…" for n in top.index]
+            ax2.barh(names, top.values, color=CHART_SEQUENTIAL, height=0.5)
+            ax2.margins(x=0.16)
+            for i, val in enumerate(top.values):
+                ax2.annotate(format_inr_short(val), (val, i), ha="left", va="center", fontsize=8,
+                             color=CHART_INK, xytext=(6, 0), textcoords="offset points")
+        else:
+            ax2.text(0.5, 0.5, "Nothing only in the Purchase Register in this report", ha="center",
+                     va="center", color=CHART_MUTED, fontsize=9, transform=ax2.transAxes)
+        ax2.set_title("Top Suppliers Not Yet in GSTR-2A/2B (ITC at Risk)", fontsize=10,
+                       fontweight="bold", loc="left")
+        ax2.grid(axis="x", color=CHART_GRID, linewidth=0.8)
+        ax2.set_axisbelow(True)
+        _style_axes(ax2)
+        fig2.tight_layout()
+        canvas2 = FigureCanvasTkAgg(fig2, master=charts_area)
+        canvas2.get_tk_widget().pack(fill="both", expand=True)
+        canvas2.draw()
 
 
 class App(tk.Tk):
@@ -1134,13 +1344,7 @@ class App(tk.Tk):
             canvas.draw()
 
     def _style_axes(self, ax):
-        ax.set_facecolor(CHART_SURFACE)
-        for spine in ("top", "right"):
-            ax.spines[spine].set_visible(False)
-        for spine in ("left", "bottom"):
-            ax.spines[spine].set_color(CHART_MUTED)
-        ax.tick_params(colors=CHART_MUTED, labelsize=8)
-        ax.title.set_color(CHART_INK)
+        _style_axes(ax)
 
     def _render_analysis(self):
         if not self._results:
@@ -1277,7 +1481,11 @@ class App(tk.Tk):
         cols = ("Run Date", "FY", "GSTR-2A Snapshot", "Purchase Data As Of", "File")
         reports_container, self.reports_tree = _make_scrollable_tree(t, cols, height=16)
         reports_container.pack(fill="both", expand=True, pady=(0, 10))
-        ttk.Button(t, text="Open Selected Report", command=self._open_selected_report).pack(anchor="w")
+        self.reports_tree.bind("<Double-1>", lambda e: self._view_report_insights())
+        btns = ttk.Frame(t)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="View Insights & Details...", command=self._view_report_insights).pack(side="left")
+        ttk.Button(btns, text="Open Excel File", command=self._open_selected_report).pack(side="left", padx=8)
 
     def _refresh_reports_tab(self):
         if not self.current_client_id:
@@ -1288,15 +1496,26 @@ class App(tk.Tk):
                 r["run_at"], r["fy_label"] or "n/a", f"#{r['snapshot_id']}", r["purchase_asof"], r["report_path"],
             ))
 
-    def _open_selected_report(self):
+    def _selected_report_path(self):
         sel = self.reports_tree.selection()
         if not sel:
-            return
+            messagebox.showwarning("Nothing selected", "Select a report first.")
+            return None
         path = self.reports_tree.item(sel[0])["values"][4]
-        if os.path.exists(path):
-            open_file(path)
-        else:
+        if not os.path.exists(path):
             messagebox.showerror("File not found", f"This report file no longer exists at:\n{path}")
+            return None
+        return path
+
+    def _open_selected_report(self):
+        path = self._selected_report_path()
+        if path:
+            open_file(path)
+
+    def _view_report_insights(self):
+        path = self._selected_report_path()
+        if path:
+            ReportViewerWindow(self, path)
 
 
 def main():
