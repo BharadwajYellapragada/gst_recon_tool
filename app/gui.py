@@ -102,6 +102,87 @@ def _apply_dpi_scaling(root):
         pass
 
 
+UI_FONT = "Segoe UI"
+
+
+def _configure_style(root):
+    """Single place defining every font/spacing/color choice, shared by all three
+    top-level windows (Activation/Login/App each run their own Tk root and thus
+    their own ttk.Style instance) so the look stays consistent and changes here
+    apply everywhere instead of hunting down repeated inline font tuples."""
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+
+    root.option_add("*Font", (UI_FONT, 10))
+    style.configure(".", font=(UI_FONT, 10))
+    style.configure("TButton", font=(UI_FONT, 10), padding=(10, 6))
+    style.configure("TEntry", padding=4)
+    style.configure("TCombobox", padding=4)
+    style.configure("TNotebook.Tab", font=(UI_FONT, 10), padding=(18, 9))
+    style.configure("Treeview", font=(UI_FONT, 9), rowheight=26)
+    style.configure("Treeview.Heading", font=(UI_FONT, 9, "bold"))
+
+    style.configure("Title.TLabel", font=(UI_FONT, 15, "bold"))
+    style.configure("Header.TLabel", font=(UI_FONT, 13, "bold"))
+    style.configure("Section.TLabel", font=(UI_FONT, 10, "bold"))
+    style.configure("Muted.TLabel", foreground="#595959")
+    style.configure("Error.TLabel", foreground="#9C0006")
+    style.configure("Summary.TLabel", font=(UI_FONT, 10, "bold"), foreground="#1F4E78")
+    return style
+
+
+_COL_WIDTHS = [
+    (("supplier", "particulars"), 250),
+    (("file",), 220),
+    (("uploaded",), 150),
+    (("period",), 130),
+    (("invoice no", "invoice_no"), 130),
+    (("gstin",), 130),
+    (("date",), 100),
+    (("snapshot #", "batch #"), 80),
+]
+_COL_DEFAULT_WIDTH = 110
+
+
+def _col_width(name):
+    """Heuristic column width by header text, shared across every Treeview in
+    the app — narrow for IDs/dates/amounts, wide for names/filenames — so long
+    values (supplier names, filenames, timestamps) aren't clipped to a few
+    characters, and long header text (e.g. 'Portal Generation Date') isn't
+    clipped either."""
+    key = name.lower()
+    header_estimate = max(90, len(name) * 7 + 20)
+    for keywords, width in _COL_WIDTHS:
+        if any(k in key for k in keywords):
+            return max(width, header_estimate)
+    return max(_COL_DEFAULT_WIDTH, header_estimate)
+
+
+def _make_scrollable_tree(parent, columns, height=10):
+    """A ttk.Treeview with vertical + horizontal scrollbars wired up and column
+    widths pre-sized via _col_width. Result sets here regularly exceed both the
+    visible height (hundreds of rows) and width (a dozen+ columns for some
+    reconciliation categories), so every Treeview in this app needs this same
+    scaffolding — built once here instead of repeated per call site."""
+    container = ttk.Frame(parent)
+    tree = ttk.Treeview(container, columns=columns, show="headings", height=height)
+    vsb = ttk.Scrollbar(container, orient="vertical", command=tree.yview)
+    hsb = ttk.Scrollbar(container, orient="horizontal", command=tree.xview)
+    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    vsb.grid(row=0, column=1, sticky="ns")
+    hsb.grid(row=1, column=0, sticky="ew")
+    container.rowconfigure(0, weight=1)
+    container.columnconfigure(0, weight=1)
+    for c in columns:
+        tree.heading(c, text=c)
+        tree.column(c, width=_col_width(c), anchor="w")
+    return container, tree
+
+
 def icon_path():
     """Location of the app icon, whether running from source or from a
     PyInstaller-frozen exe (whose bundled data lands in sys._MEIPASS)."""
@@ -142,8 +223,9 @@ class ActivationScreen(tk.Tk):
     def __init__(self):
         super().__init__()
         _apply_dpi_scaling(self)
+        _configure_style(self)
         self.title(APP_TITLE)
-        self.geometry("560x400")
+        self.geometry("580x420")
         self.resizable(False, False)
         set_app_icon(self)
         self.activated = False
@@ -151,30 +233,30 @@ class ActivationScreen(tk.Tk):
         frame = ttk.Frame(self, padding=24)
         frame.pack(fill="both", expand=True)
 
-        ttk.Label(frame, text="Activate " + APP_TITLE, font=("Arial", 14, "bold")).pack(anchor="w")
+        ttk.Label(frame, text="Activate " + APP_TITLE, style="Title.TLabel").pack(anchor="w")
         ttk.Label(frame, text="This copy of the app hasn't been activated on this computer yet. "
                               "Send the machine ID below to whoever gave you this software; they'll "
                               "send back an activation key to paste in below.",
-                  foreground="#595959", wraplength=500, justify="left").pack(anchor="w", pady=(6, 16))
+                  style="Muted.TLabel", wraplength=520, justify="left").pack(anchor="w", pady=(8, 18))
 
         ttk.Label(frame, text="This computer's Machine ID").pack(anchor="w")
         fp_row = ttk.Frame(frame)
-        fp_row.pack(fill="x", pady=(2, 16))
+        fp_row.pack(fill="x", pady=(3, 18))
         self.fp_var = tk.StringVar(value=licensing.current_fingerprint())
         fp_entry = ttk.Entry(fp_row, textvariable=self.fp_var, state="readonly")
         fp_entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(fp_row, text="Copy", command=self._copy_fingerprint).pack(side="left", padx=(6, 0))
+        ttk.Button(fp_row, text="Copy", command=self._copy_fingerprint).pack(side="left", padx=(8, 0))
 
         ttk.Label(frame, text="Activation Key").pack(anchor="w")
         self.key_var = tk.StringVar()
         key_entry = ttk.Entry(frame, textvariable=self.key_var)
-        key_entry.pack(fill="x", pady=(2, 10))
+        key_entry.pack(fill="x", pady=(3, 12))
         key_entry.bind("<Return>", lambda e: self._submit())
         key_entry.focus_set()
 
         self.error_var = tk.StringVar(value="")
-        ttk.Label(frame, textvariable=self.error_var, foreground="#9C0006", wraplength=500,
-                  justify="left").pack(anchor="w", pady=(0, 8))
+        ttk.Label(frame, textvariable=self.error_var, style="Error.TLabel", wraplength=520,
+                  justify="left").pack(anchor="w", pady=(0, 10))
 
         ttk.Button(frame, text="Activate", command=self._submit).pack(anchor="e")
 
@@ -204,8 +286,9 @@ class LoginScreen(tk.Tk):
     def __init__(self):
         super().__init__()
         _apply_dpi_scaling(self)
+        _configure_style(self)
         self.title(APP_TITLE)
-        self.geometry("420x260")
+        self.geometry("440x300")
         self.resizable(False, False)
         set_app_icon(self)
         self.unlocked = False
@@ -215,35 +298,36 @@ class LoginScreen(tk.Tk):
         frame = ttk.Frame(self, padding=24)
         frame.pack(fill="both", expand=True)
 
-        ttk.Label(frame, text=APP_TITLE, font=("Arial", 14, "bold")).pack(anchor="w")
+        ttk.Label(frame, text=APP_TITLE, style="Title.TLabel").pack(anchor="w")
 
         if self.is_first_run:
             ttk.Label(frame, text="First run on this machine — set a PIN to protect your data.\n"
                                   "This PIN is required every time the app opens, and cannot be "
                                   "recovered if forgotten (see vendor support for a reset).",
-                      foreground="#595959", wraplength=370, justify="left").pack(anchor="w", pady=(6, 16))
+                      style="Muted.TLabel", wraplength=390, justify="left").pack(anchor="w", pady=(8, 18))
             ttk.Label(frame, text="New PIN").pack(anchor="w")
             self.pin_var = tk.StringVar()
-            ttk.Entry(frame, textvariable=self.pin_var, show="*").pack(fill="x", pady=(0, 10))
+            ttk.Entry(frame, textvariable=self.pin_var, show="*").pack(fill="x", pady=(3, 12))
             ttk.Label(frame, text="Confirm PIN").pack(anchor="w")
             self.pin2_var = tk.StringVar()
             entry2 = ttk.Entry(frame, textvariable=self.pin2_var, show="*")
-            entry2.pack(fill="x", pady=(0, 10))
+            entry2.pack(fill="x", pady=(3, 12))
             entry2.bind("<Return>", lambda e: self._submit())
             btn_text = "Set PIN and continue"
         else:
             ttk.Label(frame, text="Enter your PIN to unlock this client's data.",
-                      foreground="#595959", wraplength=370, justify="left").pack(anchor="w", pady=(6, 16))
+                      style="Muted.TLabel", wraplength=390, justify="left").pack(anchor="w", pady=(8, 18))
             ttk.Label(frame, text="PIN").pack(anchor="w")
             self.pin_var = tk.StringVar()
             entry = ttk.Entry(frame, textvariable=self.pin_var, show="*")
-            entry.pack(fill="x", pady=(0, 10))
+            entry.pack(fill="x", pady=(3, 12))
             entry.bind("<Return>", lambda e: self._submit())
             entry.focus_set()
             btn_text = "Unlock"
 
         self.error_var = tk.StringVar(value="")
-        ttk.Label(frame, textvariable=self.error_var, foreground="#9C0006").pack(anchor="w", pady=(0, 8))
+        ttk.Label(frame, textvariable=self.error_var, style="Error.TLabel",
+                  wraplength=390, justify="left").pack(anchor="w", pady=(0, 10))
 
         ttk.Button(frame, text=btn_text, command=self._submit).pack(anchor="e")
 
@@ -281,22 +365,19 @@ class ConflictResolutionDialog(tk.Toplevel):
         self.client_id = client_id
         self.on_close = on_close
         self.title("Pending Purchase Register Conflicts")
-        self.geometry("980x460")
+        self.geometry("1040x480")
         self.transient(parent)
         set_app_icon(self)
 
         ttk.Label(self, text="These invoices were re-uploaded with a DIFFERENT amount than what's "
                              "already stored. They are excluded from reconciliation until you resolve "
                              "each one — Overwrite uses the new upload, Ignore keeps the stored value.",
-                  foreground="#595959", wraplength=940, justify="left", padding=10).pack(anchor="w")
+                  style="Muted.TLabel", wraplength=1000, justify="left", padding=10).pack(anchor="w")
 
         cols = ("Invoice No", "GSTIN", "Stored Gross", "New Gross", "Stored CGST", "New CGST",
                 "Stored SGST", "New SGST", "Stored IGST", "New IGST")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
-        for c in cols:
-            self.tree.heading(c, text=c)
-            self.tree.column(c, width=90, anchor="w")
-        self.tree.pack(fill="both", expand=True, padx=10)
+        tree_container, self.tree = _make_scrollable_tree(self, cols, height=14)
+        tree_container.pack(fill="both", expand=True, padx=10)
 
         btns = ttk.Frame(self, padding=10)
         btns.pack(fill="x")
@@ -357,8 +438,8 @@ class App(tk.Tk):
         super().__init__()
         _apply_dpi_scaling(self)
         self.title(APP_TITLE)
-        self.geometry("1180x720")
-        self.minsize(1000, 620)
+        self.geometry("1360x800")
+        self.minsize(1080, 660)
         set_app_icon(self)
 
         self.current_client_id = None
@@ -371,35 +452,33 @@ class App(tk.Tk):
     # ---------------- layout ----------------
 
     def _build_layout(self):
-        style = ttk.Style(self)
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-        style.configure("Treeview", rowheight=24)
-        style.configure("TNotebook.Tab", padding=(14, 8))
+        _configure_style(self)
 
-        root = ttk.Frame(self, padding=8)
+        root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
 
         # ---- left: client panel ----
-        left = ttk.Frame(root, width=280)
-        left.pack(side="left", fill="y", padx=(0, 8))
+        left = ttk.Frame(root, width=260)
+        left.pack(side="left", fill="y", padx=(0, 12))
+        left.pack_propagate(False)
 
-        ttk.Label(left, text="Clients", font=("Arial", 12, "bold")).pack(anchor="w", pady=(0, 4))
+        ttk.Label(left, text="Clients", style="Header.TLabel").pack(anchor="w", pady=(0, 6))
 
         self.search_var = tk.StringVar()
         search_entry = ttk.Entry(left, textvariable=self.search_var)
-        search_entry.pack(fill="x", pady=(0, 4))
+        search_entry.pack(fill="x", pady=(0, 6))
         search_entry.bind("<KeyRelease>", lambda e: self._refresh_client_list())
 
-        self.client_listbox = tk.Listbox(left, height=25, exportselection=False)
+        self.client_listbox = tk.Listbox(left, height=25, exportselection=False,
+                                          font=(UI_FONT, 10), activestyle="none",
+                                          relief="solid", borderwidth=1,
+                                          highlightthickness=0)
         self.client_listbox.pack(fill="both", expand=True)
         self.client_listbox.bind("<<ListboxSelect>>", self._on_client_selected)
 
         btns = ttk.Frame(left)
-        btns.pack(fill="x", pady=6)
-        ttk.Button(btns, text="+ Add Client", command=self._add_client_dialog).pack(side="left", expand=True, fill="x", padx=(0, 4))
+        btns.pack(fill="x", pady=(8, 0))
+        ttk.Button(btns, text="+ Add Client", command=self._add_client_dialog).pack(side="left", expand=True, fill="x", padx=(0, 6))
         ttk.Button(btns, text="Delete", command=self._delete_client).pack(side="left", expand=True, fill="x")
 
         # ---- right: client detail ----
@@ -407,9 +486,9 @@ class App(tk.Tk):
         right.pack(side="left", fill="both", expand=True)
 
         header_row = ttk.Frame(right)
-        header_row.pack(fill="x")
+        header_row.pack(fill="x", pady=(0, 8))
         self.header_var = tk.StringVar(value="Select or add a client to begin")
-        ttk.Label(header_row, textvariable=self.header_var, font=("Arial", 13, "bold")).pack(side="left", pady=(0, 8))
+        ttk.Label(header_row, textvariable=self.header_var, style="Title.TLabel").pack(side="left")
         self.conflicts_btn = ttk.Button(header_row, text="Resolve Pending Conflicts",
                                          command=self._open_conflicts_dialog, state="disabled")
         self.conflicts_btn.pack(side="right")
@@ -466,15 +545,16 @@ class App(tk.Tk):
     def _add_client_dialog(self):
         dlg = tk.Toplevel(self)
         dlg.title("Add Client")
-        dlg.geometry("360x160")
+        dlg.geometry("400x210")
+        dlg.resizable(False, False)
         dlg.transient(self)
         set_app_icon(dlg)
-        ttk.Label(dlg, text="Client / Business Name*").pack(anchor="w", padx=12, pady=(12, 0))
+        ttk.Label(dlg, text="Client / Business Name*").pack(anchor="w", padx=16, pady=(16, 0))
         name_var = tk.StringVar()
-        ttk.Entry(dlg, textvariable=name_var).pack(fill="x", padx=12)
-        ttk.Label(dlg, text="GSTIN (optional)").pack(anchor="w", padx=12, pady=(8, 0))
+        ttk.Entry(dlg, textvariable=name_var).pack(fill="x", padx=16, pady=(3, 0))
+        ttk.Label(dlg, text="GSTIN (optional)").pack(anchor="w", padx=16, pady=(10, 0))
         gstin_var = tk.StringVar()
-        ttk.Entry(dlg, textvariable=gstin_var).pack(fill="x", padx=12)
+        ttk.Entry(dlg, textvariable=gstin_var).pack(fill="x", padx=16, pady=(3, 0))
 
         def save():
             name = name_var.get().strip()
@@ -528,29 +608,30 @@ class App(tk.Tk):
     def _build_upload_tab(self):
         t = self.tab_upload
         ttk.Label(t, text="Step 1 — Upload the GSTR-2A/2B file downloaded from the GST portal",
-                  font=("Arial", 10, "bold")).pack(anchor="w")
+                  style="Section.TLabel").pack(anchor="w")
         ttk.Label(t, text="Each upload is kept as a dated snapshot — nothing is overwritten, "
                           "so you can track suppliers filing late over the following months.",
-                  foreground="#595959").pack(anchor="w", pady=(0, 6))
+                  style="Muted.TLabel", wraplength=1080, justify="left").pack(anchor="w", pady=(2, 8))
         self.upload_g2a_btn = ttk.Button(t, text="Select GSTR-2A/2B file(s) (.xls/.xlsx)...",
                                           command=self._upload_gstr2a, state="disabled")
-        self.upload_g2a_btn.pack(anchor="w", pady=(0, 16))
+        self.upload_g2a_btn.pack(anchor="w", pady=(0, 18))
 
         ttk.Label(t, text="Step 2 — Upload the Purchase Register (monthly file, or a full year at once)",
-                  font=("Arial", 10, "bold")).pack(anchor="w")
+                  style="Section.TLabel").pack(anchor="w")
         ttk.Label(t, text="Upload each month's file as it becomes available, or a full-year file — rows "
                           "are auto-tagged by month/FY. Anything already stored is automatically skipped, "
                           "so it's safe to re-upload the same file by mistake. Re-uploading the same "
                           "invoice with a DIFFERENT amount is held as a pending conflict for review "
                           "(see the 'Resolve Pending Conflicts' button above).",
-                  foreground="#595959", wraplength=900, justify="left").pack(anchor="w", pady=(0, 6))
+                  style="Muted.TLabel", wraplength=1080, justify="left").pack(anchor="w", pady=(2, 8))
         self.upload_pr_btn = ttk.Button(t, text="Select Purchase Register file(s) (.xls/.xlsx)...",
                                          command=self._upload_purchase, state="disabled")
-        self.upload_pr_btn.pack(anchor="w", pady=(0, 16))
+        self.upload_pr_btn.pack(anchor="w", pady=(0, 18))
 
-        ttk.Separator(t).pack(fill="x", pady=8)
+        ttk.Separator(t).pack(fill="x", pady=10)
         self.upload_log = tk.Text(t, height=14, wrap="word", state="disabled",
-                                   bg="#F7F7F7", relief="flat")
+                                   bg="#F7F7F7", relief="flat", font=(UI_FONT, 9),
+                                   padx=8, pady=6)
         self.upload_log.pack(fill="both", expand=True)
 
     def _log(self, widget, msg):
@@ -645,29 +726,23 @@ class App(tk.Tk):
 
     def _build_history_tab(self):
         t = self.tab_history
-        ttk.Label(t, text="GSTR-2A/2B Snapshots", font=("Arial", 10, "bold")).pack(anchor="w")
+        ttk.Label(t, text="GSTR-2A/2B Snapshots", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
         cols = ("Snapshot #", "Uploaded", "File", "Portal Generation Date", "Periods", "Invoices")
-        self.snap_tree = ttk.Treeview(t, columns=cols, show="headings", height=8)
-        for c in cols:
-            self.snap_tree.heading(c, text=c)
-            self.snap_tree.column(c, width=80 if c in ("Snapshot #", "Invoices") else 180, anchor="w")
-        self.snap_tree.pack(fill="x", pady=(4, 0))
+        snap_container, self.snap_tree = _make_scrollable_tree(t, cols, height=8)
+        snap_container.pack(fill="x", pady=(0, 8))
         snap_btns = ttk.Frame(t)
-        snap_btns.pack(fill="x", pady=(4, 16))
+        snap_btns.pack(fill="x", pady=(0, 20))
         ttk.Button(snap_btns, text="Download Selected...", command=self._download_snapshot).pack(side="left")
-        ttk.Button(snap_btns, text="Delete Selected", command=self._delete_snapshot).pack(side="left", padx=6)
+        ttk.Button(snap_btns, text="Delete Selected", command=self._delete_snapshot).pack(side="left", padx=8)
 
-        ttk.Label(t, text="Purchase Register Upload Batches", font=("Arial", 10, "bold")).pack(anchor="w")
+        ttk.Label(t, text="Purchase Register Upload Batches", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
         cols2 = ("Batch #", "Uploaded", "File", "Rows in File", "New", "Skipped (dup)", "Pending Conflicts")
-        self.batch_tree = ttk.Treeview(t, columns=cols2, show="headings", height=10)
-        for c in cols2:
-            self.batch_tree.heading(c, text=c)
-            self.batch_tree.column(c, width=70 if c == "Batch #" else 150, anchor="w")
-        self.batch_tree.pack(fill="both", expand=True, pady=(4, 0))
+        batch_container, self.batch_tree = _make_scrollable_tree(t, cols2, height=10)
+        batch_container.pack(fill="both", expand=True, pady=(0, 8))
         batch_btns = ttk.Frame(t)
-        batch_btns.pack(fill="x", pady=(4, 0))
+        batch_btns.pack(fill="x")
         ttk.Button(batch_btns, text="Download Selected...", command=self._download_batch).pack(side="left")
-        ttk.Button(batch_btns, text="Delete Selected", command=self._delete_batch).pack(side="left", padx=6)
+        ttk.Button(batch_btns, text="Delete Selected", command=self._delete_batch).pack(side="left", padx=8)
 
     def _refresh_history_tab(self):
         if not self.current_client_id:
@@ -764,7 +839,7 @@ class App(tk.Tk):
     def _build_recon_tab(self):
         t = self.tab_recon
         top = ttk.Frame(t)
-        top.pack(fill="x", pady=(0, 4))
+        top.pack(fill="x", pady=(0, 8))
         ttk.Label(top, text="Financial Year:").pack(side="left")
         self.fy_var = tk.StringVar()
         self.fy_combo = ttk.Combobox(top, textvariable=self.fy_var, width=14, state="readonly")
@@ -772,10 +847,10 @@ class App(tk.Tk):
         ttk.Button(top, text="Run Reconciliation", command=self._run_reconciliation).pack(side="left", padx=8)
         ttk.Label(top, text="GSTR-2A data used is automatically merged across every snapshot "
                             "uploaded for this client — no manual selection needed.",
-                  foreground="#595959").pack(side="left", padx=(16, 0))
+                  style="Muted.TLabel", wraplength=560, justify="left").pack(side="left", padx=(16, 0))
 
         month_row = ttk.Frame(t)
-        month_row.pack(fill="x", pady=(0, 10))
+        month_row.pack(fill="x", pady=(0, 14))
         ttk.Label(month_row, text="Export one month of Purchase Register data:").pack(side="left")
         self.month_var = tk.StringVar()
         self.month_combo = ttk.Combobox(month_row, textvariable=self.month_var, width=14, state="readonly")
@@ -783,13 +858,14 @@ class App(tk.Tk):
         ttk.Button(month_row, text="Export Month to Excel...", command=self._export_month).pack(side="left")
 
         self.recon_summary_var = tk.StringVar(value="")
-        ttk.Label(t, textvariable=self.recon_summary_var, foreground="#1F4E78",
-                  font=("Arial", 10, "bold"), wraplength=1000, justify="left").pack(anchor="w", pady=(0, 2))
+        ttk.Label(t, textvariable=self.recon_summary_var, style="Summary.TLabel",
+                  wraplength=1200, justify="left").pack(anchor="w", pady=(0, 3))
         self.recon_cutoff_var = tk.StringVar(value="")
-        ttk.Label(t, textvariable=self.recon_cutoff_var, font=("Arial", 9, "bold")).pack(anchor="w", pady=(0, 6))
+        ttk.Label(t, textvariable=self.recon_cutoff_var, wraplength=1200,
+                  justify="left").pack(anchor="w", pady=(0, 10))
 
         filt = ttk.Frame(t)
-        filt.pack(fill="x", pady=(0, 4))
+        filt.pack(fill="x", pady=(0, 8))
         ttk.Label(filt, text="View category:").pack(side="left")
         self.category_var = tk.StringVar(value="value_tax_mismatches")
         self.category_combo = ttk.Combobox(filt, textvariable=self.category_var, state="readonly", width=45, values=[
@@ -799,8 +875,8 @@ class App(tk.Tk):
         self.category_combo.pack(side="left", padx=8)
         self.category_combo.bind("<<ComboboxSelected>>", lambda e: self._render_category())
 
-        self.result_tree = ttk.Treeview(t, show="headings")
-        self.result_tree.pack(fill="both", expand=True, pady=(4, 8))
+        result_container, self.result_tree = _make_scrollable_tree(t, (), height=16)
+        result_container.pack(fill="both", expand=True, pady=(0, 10))
 
         btns = ttk.Frame(t)
         btns.pack(fill="x")
@@ -880,11 +956,11 @@ class App(tk.Tk):
             cols, rename = spec
             cols = [c for c in cols if c in df.columns]
             df = df[cols].rename(columns=rename)
-        display_cols = list(df.columns)[:12]
+        display_cols = list(df.columns)[:17]
         self.result_tree["columns"] = display_cols
         for c in display_cols:
             self.result_tree.heading(c, text=c)
-            self.result_tree.column(c, width=120, anchor="w")
+            self.result_tree.column(c, width=_col_width(c), anchor="w")
         for _, row in df.head(500).iterrows():
             self.result_tree.insert("", "end", values=[row[c] for c in display_cols])
 
@@ -935,13 +1011,11 @@ class App(tk.Tk):
 
     def _build_reports_tab(self):
         t = self.tab_reports
-        ttk.Label(t, text="Past reconciliation reports for this client", font=("Arial", 10, "bold")).pack(anchor="w")
+        ttk.Label(t, text="Past reconciliation reports for this client",
+                  style="Section.TLabel").pack(anchor="w", pady=(0, 6))
         cols = ("Run Date", "FY", "GSTR-2A Snapshot", "Purchase Data As Of", "File")
-        self.reports_tree = ttk.Treeview(t, columns=cols, show="headings")
-        for c in cols:
-            self.reports_tree.heading(c, text=c)
-            self.reports_tree.column(c, width=180, anchor="w")
-        self.reports_tree.pack(fill="both", expand=True, pady=(4, 8))
+        reports_container, self.reports_tree = _make_scrollable_tree(t, cols, height=16)
+        reports_container.pack(fill="both", expand=True, pady=(0, 10))
         ttk.Button(t, text="Open Selected Report", command=self._open_selected_report).pack(anchor="w")
 
     def _refresh_reports_tab(self):
