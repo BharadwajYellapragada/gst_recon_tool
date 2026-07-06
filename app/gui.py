@@ -16,7 +16,61 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.ticker import FuncFormatter
+
 from . import db, parsers, reconcile, report, service, security, licensing
+
+# Reference palette (light mode) — see the dataviz skill's references/palette.md.
+# Categorical slots are used in this fixed order (never cycled/generated) for the
+# 6 fixed reconciliation categories; CHART_SEQUENTIAL is the single hue used for
+# every magnitude/ranking chart (top suppliers, monthly trend).
+CHART_CATEGORICAL = ["#2a78d6", "#1baf7a", "#eda100", "#008300", "#4a3aa7", "#e34948"]
+CHART_SEQUENTIAL = "#2a78d6"
+CHART_INK = "#0b0b0b"
+CHART_MUTED = "#898781"
+CHART_GRID = "#e1e0d9"
+CHART_SURFACE = "#fcfcfb"
+
+
+def format_inr(value, decimals=0):
+    """Indian digit grouping (last 3 digits, then pairs: 1,23,45,678) rather than
+    Western thousands-grouping — this is a GST tool for Indian accounting, and
+    ₹5,425,630 (Western) reads oddly next to the lakh/crore figures accountants
+    actually use, i.e. ₹54,25,630."""
+    neg = value < 0
+    value = abs(value)
+    s = f"{value:,.{decimals}f}"
+    int_part, _, dec_part = s.replace(",", "").partition(".")
+    if len(int_part) > 3:
+        last3 = int_part[-3:]
+        rest = int_part[:-3]
+        groups = []
+        while len(rest) > 2:
+            groups.insert(0, rest[-2:])
+            rest = rest[:-2]
+        if rest:
+            groups.insert(0, rest)
+        int_part = ",".join(groups) + "," + last3
+    out = f"₹{int_part}" + (f".{dec_part}" if dec_part else "")
+    return f"-{out}" if neg else out
+
+
+def format_inr_short(value):
+    """Compact lakh/crore notation for chart labels/axis ticks, e.g. 5425630 -> '₹54.3L'."""
+    neg = value < 0
+    value = abs(value)
+    sign = "-" if neg else ""
+    if value >= 1e7:
+        return f"{sign}₹{value / 1e7:.2f}Cr"
+    if value >= 1e5:
+        return f"{sign}₹{value / 1e5:.1f}L"
+    if value >= 1e3:
+        return f"{sign}₹{value / 1e3:.1f}K"
+    return f"{sign}₹{value:.0f}"
 
 APP_TITLE = "GST Reconciliation Tool"
 
@@ -181,6 +235,38 @@ def _make_scrollable_tree(parent, columns, height=10):
         tree.heading(c, text=c)
         tree.column(c, width=_col_width(c), anchor="w")
     return container, tree
+
+
+def _make_scrollable_frame(parent, bg=None):
+    """A vertically scrollable area for content taller than the tab (e.g. several
+    stacked chart panels) — a plain pack/grid layout has no scroll of its own, so
+    without this, tall content just gets cut off by the window instead of being
+    reachable by scrolling."""
+    container = ttk.Frame(parent)
+    canvas = tk.Canvas(container, highlightthickness=0, bg=bg or CHART_SURFACE)
+    vsb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+    inner = ttk.Frame(canvas)
+    inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=vsb.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    vsb.pack(side="right", fill="y")
+    canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+    return container, inner
+
+
+def _bind_dynamic_wraplength(label, container, margin=24):
+    """Keeps a label's wraplength in sync with its container's actual width. A
+    static wraplength is wrong in either direction once a window can be resized
+    or maximized: too small and long status lines wrap early even with plenty of
+    room free (e.g. the reconciliation summary line); too large and it overflows
+    a narrowed window instead of wrapping."""
+    def _update(event=None):
+        width = container.winfo_width() - margin
+        if width > 100:
+            label.configure(wraplength=width)
+    container.bind("<Configure>", _update)
+    label.after(50, _update)
 
 
 def icon_path():
@@ -441,6 +527,10 @@ class App(tk.Tk):
         self.geometry("1360x800")
         self.minsize(1080, 660)
         set_app_icon(self)
+        try:
+            self.state("zoomed")  # start maximized; falls back to the geometry above if unsupported
+        except tk.TclError:
+            pass
 
         self.current_client_id = None
         self._results = None
@@ -609,21 +699,25 @@ class App(tk.Tk):
         t = self.tab_upload
         ttk.Label(t, text="Step 1 — Upload the GSTR-2A/2B file downloaded from the GST portal",
                   style="Section.TLabel").pack(anchor="w")
-        ttk.Label(t, text="Each upload is kept as a dated snapshot — nothing is overwritten, "
+        lbl1 = ttk.Label(t, text="Each upload is kept as a dated snapshot — nothing is overwritten, "
                           "so you can track suppliers filing late over the following months.",
-                  style="Muted.TLabel", wraplength=1080, justify="left").pack(anchor="w", pady=(2, 8))
+                  style="Muted.TLabel", justify="left")
+        lbl1.pack(anchor="w", pady=(2, 8))
+        _bind_dynamic_wraplength(lbl1, t)
         self.upload_g2a_btn = ttk.Button(t, text="Select GSTR-2A/2B file(s) (.xls/.xlsx)...",
                                           command=self._upload_gstr2a, state="disabled")
         self.upload_g2a_btn.pack(anchor="w", pady=(0, 18))
 
         ttk.Label(t, text="Step 2 — Upload the Purchase Register (monthly file, or a full year at once)",
                   style="Section.TLabel").pack(anchor="w")
-        ttk.Label(t, text="Upload each month's file as it becomes available, or a full-year file — rows "
+        lbl2 = ttk.Label(t, text="Upload each month's file as it becomes available, or a full-year file — rows "
                           "are auto-tagged by month/FY. Anything already stored is automatically skipped, "
                           "so it's safe to re-upload the same file by mistake. Re-uploading the same "
                           "invoice with a DIFFERENT amount is held as a pending conflict for review "
                           "(see the 'Resolve Pending Conflicts' button above).",
-                  style="Muted.TLabel", wraplength=1080, justify="left").pack(anchor="w", pady=(2, 8))
+                  style="Muted.TLabel", justify="left")
+        lbl2.pack(anchor="w", pady=(2, 8))
+        _bind_dynamic_wraplength(lbl2, t)
         self.upload_pr_btn = ttk.Button(t, text="Select Purchase Register file(s) (.xls/.xlsx)...",
                                          command=self._upload_purchase, state="disabled")
         self.upload_pr_btn.pack(anchor="w", pady=(0, 18))
@@ -858,12 +952,31 @@ class App(tk.Tk):
         ttk.Button(month_row, text="Export Month to Excel...", command=self._export_month).pack(side="left")
 
         self.recon_summary_var = tk.StringVar(value="")
-        ttk.Label(t, textvariable=self.recon_summary_var, style="Summary.TLabel",
-                  wraplength=1200, justify="left").pack(anchor="w", pady=(0, 3))
+        summary_lbl = ttk.Label(t, textvariable=self.recon_summary_var, style="Summary.TLabel", justify="left")
+        summary_lbl.pack(anchor="w", pady=(0, 3))
+        _bind_dynamic_wraplength(summary_lbl, t)
         self.recon_cutoff_var = tk.StringVar(value="")
-        ttk.Label(t, textvariable=self.recon_cutoff_var, wraplength=1200,
-                  justify="left").pack(anchor="w", pady=(0, 10))
+        cutoff_lbl = ttk.Label(t, textvariable=self.recon_cutoff_var, justify="left")
+        cutoff_lbl.pack(anchor="w", pady=(0, 10))
+        _bind_dynamic_wraplength(cutoff_lbl, t)
 
+        # Category detail (table) and Insights (KPIs/charts) share the FY controls
+        # above but are otherwise two different views onto the same reconciliation
+        # run, so they live as inner sub-tabs of Reconciliation rather than a
+        # separate top-level tab.
+        self.recon_inner_notebook = ttk.Notebook(t)
+        self.recon_inner_notebook.pack(fill="both", expand=True)
+        self.recon_subtab_details = ttk.Frame(self.recon_inner_notebook, padding=(0, 10))
+        self.recon_subtab_insights = ttk.Frame(self.recon_inner_notebook, padding=(0, 10))
+        self.recon_inner_notebook.add(self.recon_subtab_details, text="Category Details")
+        self.recon_inner_notebook.add(self.recon_subtab_insights, text="Insights")
+
+        self._build_details_subtab(self.recon_subtab_details)
+        self._build_insights_subtab(self.recon_subtab_insights)
+
+        self._results = None
+
+    def _build_details_subtab(self, t):
         filt = ttk.Frame(t)
         filt.pack(fill="x", pady=(0, 8))
         ttk.Label(filt, text="View category:").pack(side="left")
@@ -881,8 +994,6 @@ class App(tk.Tk):
         btns = ttk.Frame(t)
         btns.pack(fill="x")
         ttk.Button(btns, text="Export Full Report to Excel...", command=self._export_report).pack(side="left")
-
-        self._results = None
 
     def _refresh_recon_tab(self):
         if not self.current_client_id:
@@ -906,6 +1017,7 @@ class App(tk.Tk):
         self.result_tree.delete(*self.result_tree.get_children())
         self.recon_summary_var.set("")
         self.recon_cutoff_var.set("")
+        self._reset_analysis_tab()
 
     def _run_reconciliation(self):
         if not self.fy_var.get():
@@ -938,6 +1050,7 @@ class App(tk.Tk):
             f"(most recent uploaded {self._current_fy_meta['gstr2a_latest_uploaded_at']})"
         )
         self._render_category()
+        self._render_analysis()
 
     def _render_category(self):
         self.result_tree.delete(*self.result_tree.get_children())
@@ -963,6 +1076,154 @@ class App(tk.Tk):
             self.result_tree.column(c, width=_col_width(c), anchor="w")
         for _, row in df.head(500).iterrows():
             self.result_tree.insert("", "end", values=[row[c] for c in display_cols])
+
+    def _build_insights_subtab(self, t):
+        self.analysis_info_var = tk.StringVar(value="Run a reconciliation above to see insights.")
+        ttk.Label(t, textvariable=self.analysis_info_var, style="Muted.TLabel").pack(anchor="w", pady=(0, 14))
+
+        kpi_row = ttk.Frame(t)
+        kpi_row.pack(fill="x", pady=(0, 16))
+        self.kpi_vars = {}
+        kpi_defs = [
+            ("purchase_total", "Total Purchase Value (FY)"),
+            ("matched_value", "Matched Value"),
+            ("itc_at_risk", "ITC at Risk (Only in Books)"),
+            ("mismatch_value", "Mismatch Value (abs)"),
+        ]
+        for i, (key, label) in enumerate(kpi_defs):
+            tile = ttk.Frame(kpi_row, relief="solid", borderwidth=1, padding=14)
+            tile.pack(side="left", fill="both", expand=True, padx=(0 if i == 0 else 10, 0))
+            var = tk.StringVar(value="—")
+            ttk.Label(tile, textvariable=var, font=(UI_FONT, 18, "bold")).pack(anchor="w")
+            ttk.Label(tile, text=label, style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
+            self.kpi_vars[key] = var
+
+        # Charts are stacked full-width in a scrollable area rather than
+        # squeezed side-by-side, so nothing gets crunched regardless of window
+        # size — the supplier chart in particular needs real vertical room for
+        # up to 8 bars with names and value labels.
+        scroll_container, charts_area = _make_scrollable_frame(t)
+        scroll_container.pack(fill="both", expand=True)
+
+        self.fig_categories = Figure(figsize=(10.5, 3.2), dpi=96, facecolor=CHART_SURFACE)
+        self.ax_categories = self.fig_categories.add_subplot(111)
+        self.canvas_categories = FigureCanvasTkAgg(self.fig_categories, master=charts_area)
+        self.canvas_categories.get_tk_widget().pack(fill="both", expand=True, pady=(0, 16))
+
+        self.fig_monthly = Figure(figsize=(10.5, 3.0), dpi=96, facecolor=CHART_SURFACE)
+        self.ax_monthly = self.fig_monthly.add_subplot(111)
+        self.canvas_monthly = FigureCanvasTkAgg(self.fig_monthly, master=charts_area)
+        self.canvas_monthly.get_tk_widget().pack(fill="both", expand=True, pady=(0, 16))
+
+        self.fig_suppliers = Figure(figsize=(10.5, 4.6), dpi=96, facecolor=CHART_SURFACE)
+        self.ax_suppliers = self.fig_suppliers.add_subplot(111)
+        self.canvas_suppliers = FigureCanvasTkAgg(self.fig_suppliers, master=charts_area)
+        self.canvas_suppliers.get_tk_widget().pack(fill="both", expand=True)
+
+        self._reset_analysis_tab()
+
+    def _reset_analysis_tab(self):
+        self.analysis_info_var.set("Run a reconciliation above to see insights.")
+        for var in self.kpi_vars.values():
+            var.set("—")
+        for ax, canvas in ((self.ax_categories, self.canvas_categories),
+                           (self.ax_monthly, self.canvas_monthly),
+                           (self.ax_suppliers, self.canvas_suppliers)):
+            ax.clear()
+            ax.axis("off")
+            canvas.draw()
+
+    def _style_axes(self, ax):
+        ax.set_facecolor(CHART_SURFACE)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        for spine in ("left", "bottom"):
+            ax.spines[spine].set_color(CHART_MUTED)
+        ax.tick_params(colors=CHART_MUTED, labelsize=8)
+        ax.title.set_color(CHART_INK)
+
+    def _render_analysis(self):
+        if not self._results:
+            self._reset_analysis_tab()
+            return
+        r = self._results
+        meta = self._current_fy_meta
+        fy_label = meta["fy_label"]
+        self.analysis_info_var.set(f"FY {fy_label}")
+
+        matched_value = r["matched_clean"]["invoice_value"].sum() if len(r["matched_clean"]) else 0
+        itc_at_risk = r["only_in_purchase_register"]["gross_total"].sum() if len(r["only_in_purchase_register"]) else 0
+        mismatch_value = r["value_tax_mismatches"]["diff_value"].abs().sum() if len(r["value_tax_mismatches"]) else 0
+        pr_fy_df = db.get_purchase_entries_by_fy(self.current_client_id, fy_label)
+        purchase_total = pr_fy_df["gross_total"].sum() if len(pr_fy_df) else 0
+
+        self.kpi_vars["purchase_total"].set(format_inr(purchase_total))
+        self.kpi_vars["matched_value"].set(format_inr(matched_value))
+        self.kpi_vars["itc_at_risk"].set(format_inr(itc_at_risk))
+        self.kpi_vars["mismatch_value"].set(format_inr(mismatch_value))
+
+        # Category counts: each bar is a distinct, named category -> categorical color.
+        ax = self.ax_categories
+        ax.clear()
+        ax.axis("on")
+        labels = ["Matched\nClean", "Value/Tax\nMismatches", "Probable\nMatches",
+                  "Only in\nGSTR-2A", "Only in\nBooks", "Pending\nConflicts"]
+        values = [len(r["matched_clean"]), len(r["value_tax_mismatches"]), len(r["probable_matches"]),
+                  len(r["only_in_gstr2a"]), len(r["only_in_purchase_register"]), meta["pending_conflicts_count"]]
+        bars = ax.bar(labels, values, color=CHART_CATEGORICAL, width=0.6)
+        for bar, val in zip(bars, values):
+            ax.annotate(str(val), (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                        ha="center", va="bottom", fontsize=8, color=CHART_INK)
+        ax.set_title("Reconciliation Categories", fontsize=10, fontweight="bold", loc="left")
+        ax.grid(axis="y", color=CHART_GRID, linewidth=0.8)
+        ax.set_axisbelow(True)
+        self._style_axes(ax)
+        self.fig_categories.tight_layout()
+        self.canvas_categories.draw()
+
+        # Monthly Purchase Register totals: a single series' magnitude -> one sequential hue.
+        ax = self.ax_monthly
+        ax.clear()
+        ax.axis("on")
+        if len(pr_fy_df):
+            monthly = pr_fy_df.groupby("entry_month")["gross_total"].sum().sort_index()
+            month_labels = [f"{m[5:7]}/{m[2:4]}" for m in monthly.index]
+            ax.bar(month_labels, monthly.values, color=CHART_SEQUENTIAL, width=0.6)
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: format_inr_short(x)))
+        else:
+            ax.text(0.5, 0.5, "No Purchase Register data for this FY", ha="center", va="center",
+                    color=CHART_MUTED, fontsize=9, transform=ax.transAxes)
+        ax.set_title("Monthly Purchase Register Total", fontsize=10, fontweight="bold", loc="left")
+        ax.grid(axis="y", color=CHART_GRID, linewidth=0.8)
+        ax.set_axisbelow(True)
+        self._style_axes(ax)
+        self.fig_monthly.tight_layout()
+        self.canvas_monthly.draw()
+
+        # Top suppliers only in the Purchase Register (ITC at risk): a ranking of one
+        # series -> one sequential hue, not a color per bar (color follows entity, not rank).
+        ax = self.ax_suppliers
+        ax.clear()
+        ax.axis("on")
+        only_pr = r["only_in_purchase_register"]
+        if len(only_pr):
+            top = only_pr.groupby("particulars")["gross_total"].sum().sort_values(ascending=False).head(8)
+            top = top.sort_values(ascending=True)
+            names = [n if len(n) <= 24 else n[:21] + "…" for n in top.index]
+            ax.barh(names, top.values, color=CHART_SEQUENTIAL, height=0.5)
+            ax.margins(x=0.16)
+            for i, val in enumerate(top.values):
+                ax.annotate(format_inr_short(val), (val, i), ha="left", va="center", fontsize=8,
+                            color=CHART_INK, xytext=(6, 0), textcoords="offset points")
+        else:
+            ax.text(0.5, 0.5, "Nothing only in the Purchase Register for this FY", ha="center", va="center",
+                    color=CHART_MUTED, fontsize=9, transform=ax.transAxes)
+        ax.set_title("Top Suppliers Not Yet in GSTR-2A/2B (ITC at Risk)", fontsize=10, fontweight="bold", loc="left")
+        ax.grid(axis="x", color=CHART_GRID, linewidth=0.8)
+        ax.set_axisbelow(True)
+        self._style_axes(ax)
+        self.fig_suppliers.tight_layout()
+        self.canvas_suppliers.draw()
 
     def _export_report(self):
         if not self._results:
