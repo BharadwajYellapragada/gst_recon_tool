@@ -100,6 +100,18 @@ def _excel_serial_to_ddmmyyyy(serial):
         return str(serial)
 
 
+def _to_pydate(val):
+    """Excel date cells surface as datetime.datetime (openpyxl, date-formatted cells)
+    or as a numeric day serial (xlrd, or openpyxl on plain-number cells)."""
+    if isinstance(val, datetime.datetime):
+        return val.date()
+    if isinstance(val, datetime.date):
+        return val
+    if isinstance(val, (int, float)) and val > 0:
+        return (datetime.datetime(1899, 12, 30) + datetime.timedelta(days=float(val))).date()
+    return None
+
+
 def parse_purchase_register(path):
     """
     Returns a list of dicts ready for db.add_purchase_batch(), by locating the header
@@ -167,7 +179,8 @@ def parse_purchase_register(path):
         if i_date >= len(row):
             continue
         date_val = row[i_date]
-        if not isinstance(date_val, (int, float)) or date_val <= 0:
+        entry_date_obj = _to_pydate(date_val)
+        if entry_date_obj is None:
             continue
         gstin = str(row[i_gstin]).strip().upper() if i_gstin < len(row) and row[i_gstin] else ""
         invno = str(row[i_invno]).strip() if i_invno < len(row) and row[i_invno] else ""
@@ -179,10 +192,10 @@ def parse_purchase_register(path):
         igst = _num(row[i_igst]) if i_igst is not None and i_igst < len(row) else 0
         gross = _num(row[i_gross]) if i_gross < len(row) else 0
         inv_date_raw = row[i_invdate] if i_invdate is not None and i_invdate < len(row) else date_val
-        inv_date_fmt = _excel_serial_to_ddmmyyyy(inv_date_raw) if isinstance(inv_date_raw, (int, float)) else str(inv_date_raw)
-        entry_date_fmt = _excel_serial_to_ddmmyyyy(date_val)
-        entry_date_obj = datetime.datetime(1899, 12, 30) + datetime.timedelta(days=float(date_val))
-        entry_fy = fy_utils.fy_label_for_date(entry_date_obj.date())
+        inv_date_obj = _to_pydate(inv_date_raw) or entry_date_obj
+        inv_date_fmt = inv_date_obj.strftime("%d/%m/%Y")
+        entry_date_fmt = entry_date_obj.strftime("%d/%m/%Y")
+        entry_fy = fy_utils.fy_label_for_date(entry_date_obj)
         entry_month = entry_date_obj.strftime("%Y-%m")
 
         entries.append({
