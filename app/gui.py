@@ -20,6 +20,60 @@ from . import db, parsers, reconcile, report, service, security, licensing
 
 APP_TITLE = "GST Reconciliation Tool"
 
+# Mirrors report.py's per-category column choices: the raw reconciliation
+# DataFrames are outer-merge results carrying BOTH sides' columns (g2a_agg's
+# come first since it's the merge's left side), so a naive "first 12 columns"
+# preview shows all-NaN _2a columns for rows that only exist in the Purchase
+# Register (and vice versa). Picking the side that's actually populated per
+# category keeps the on-screen preview consistent with the exported report.
+_CATEGORY_COLUMNS = {
+    "value_tax_mismatches": (
+        ["gstin_2a", "supplier_name", "invoice_no_2a", "invoice_no_pr", "invoice_date_2a",
+         "invoice_value", "gross_total", "diff_value", "igst_2a", "igst_pr", "diff_igst",
+         "cgst_2a", "cgst_pr", "diff_cgst", "sgst_2a", "sgst_pr", "diff_sgst"],
+        {"gstin_2a": "GSTIN", "supplier_name": "Supplier Name", "invoice_no_2a": "Invoice No (2A)",
+         "invoice_no_pr": "Invoice No (Books)", "invoice_date_2a": "Invoice Date",
+         "invoice_value": "Invoice Value (2A)", "gross_total": "Gross Total (Books)",
+         "diff_value": "Diff Value", "igst_2a": "IGST (2A)", "igst_pr": "IGST (Books)",
+         "diff_igst": "Diff IGST", "cgst_2a": "CGST (2A)", "cgst_pr": "CGST (Books)",
+         "diff_cgst": "Diff CGST", "sgst_2a": "SGST (2A)", "sgst_pr": "SGST (Books)", "diff_sgst": "Diff SGST"},
+    ),
+    "probable_matches": (
+        ["gstin_2a", "supplier_name", "invoice_no_2a", "invoice_no_pr", "invoice_date_2a",
+         "invoice_value", "gross_total"],
+        {"gstin_2a": "GSTIN", "supplier_name": "Supplier Name", "invoice_no_2a": "Invoice No (2A)",
+         "invoice_no_pr": "Invoice No (Books)", "invoice_date_2a": "Invoice Date",
+         "invoice_value": "Invoice Value (2A)", "gross_total": "Gross Total (Books)"},
+    ),
+    "only_in_gstr2a": (
+        ["gstin_2a", "supplier_name", "invoice_no_2a", "invoice_date_2a", "invoice_value",
+         "taxable_value", "igst_2a", "cgst_2a", "sgst_2a", "itc_available", "period"],
+        {"gstin_2a": "GSTIN", "supplier_name": "Supplier Name", "invoice_no_2a": "Invoice No",
+         "invoice_date_2a": "Invoice Date", "invoice_value": "Invoice Value",
+         "taxable_value": "Taxable Value", "igst_2a": "IGST", "cgst_2a": "CGST", "sgst_2a": "SGST",
+         "itc_available": "ITC Available"},
+    ),
+    "only_in_purchase_register": (
+        ["gstin_pr", "particulars", "invoice_no_pr", "invoice_date_pr", "gross_total",
+         "igst_pr", "cgst_pr", "sgst_pr"],
+        {"gstin_pr": "GSTIN", "particulars": "Supplier Name", "invoice_no_pr": "Invoice No",
+         "invoice_date_pr": "Invoice Date", "gross_total": "Gross Total", "igst_pr": "IGST",
+         "cgst_pr": "CGST", "sgst_pr": "SGST"},
+    ),
+    "matched_clean": (
+        ["gstin_2a", "supplier_name", "invoice_no_2a", "invoice_date_2a", "invoice_value",
+         "igst_2a", "cgst_2a", "sgst_2a", "itc_available"],
+        {"gstin_2a": "GSTIN", "supplier_name": "Supplier Name", "invoice_no_2a": "Invoice No",
+         "invoice_date_2a": "Invoice Date", "invoice_value": "Invoice Value", "igst_2a": "IGST",
+         "cgst_2a": "CGST", "sgst_2a": "SGST", "itc_available": "ITC Available"},
+    ),
+    "multi_rate_reference": (
+        ["period", "gstin", "supplier_name", "invoice_no", "invoice_date", "invoice_value",
+         "rate", "taxable_value", "igst", "cgst", "sgst"],
+        {"supplier_name": "Supplier Name"},
+    ),
+}
+
 
 def _enable_dpi_awareness():
     """Without this, Windows bitmap-stretches the whole window on scaled displays,
@@ -592,11 +646,11 @@ class App(tk.Tk):
     def _build_history_tab(self):
         t = self.tab_history
         ttk.Label(t, text="GSTR-2A/2B Snapshots", font=("Arial", 10, "bold")).pack(anchor="w")
-        cols = ("Uploaded", "File", "Portal Generation Date", "Periods", "Invoices")
+        cols = ("Snapshot #", "Uploaded", "File", "Portal Generation Date", "Periods", "Invoices")
         self.snap_tree = ttk.Treeview(t, columns=cols, show="headings", height=8)
         for c in cols:
             self.snap_tree.heading(c, text=c)
-            self.snap_tree.column(c, width=180 if c != "Invoices" else 80, anchor="w")
+            self.snap_tree.column(c, width=80 if c in ("Snapshot #", "Invoices") else 180, anchor="w")
         self.snap_tree.pack(fill="x", pady=(4, 0))
         snap_btns = ttk.Frame(t)
         snap_btns.pack(fill="x", pady=(4, 16))
@@ -604,11 +658,11 @@ class App(tk.Tk):
         ttk.Button(snap_btns, text="Delete Selected", command=self._delete_snapshot).pack(side="left", padx=6)
 
         ttk.Label(t, text="Purchase Register Upload Batches", font=("Arial", 10, "bold")).pack(anchor="w")
-        cols2 = ("Uploaded", "File", "Rows in File", "New", "Skipped (dup)", "Pending Conflicts")
+        cols2 = ("Batch #", "Uploaded", "File", "Rows in File", "New", "Skipped (dup)", "Pending Conflicts")
         self.batch_tree = ttk.Treeview(t, columns=cols2, show="headings", height=10)
         for c in cols2:
             self.batch_tree.heading(c, text=c)
-            self.batch_tree.column(c, width=150, anchor="w")
+            self.batch_tree.column(c, width=70 if c == "Batch #" else 150, anchor="w")
         self.batch_tree.pack(fill="both", expand=True, pady=(4, 0))
         batch_btns = ttk.Frame(t)
         batch_btns.pack(fill="x", pady=(4, 0))
@@ -621,13 +675,13 @@ class App(tk.Tk):
         self.snap_tree.delete(*self.snap_tree.get_children())
         for s in db.list_snapshots(self.current_client_id):
             self.snap_tree.insert("", "end", iid=str(s["snapshot_id"]), values=(
-                s["uploaded_at"], s["source_filename"], s["generation_date"] or "n/a",
+                s["snapshot_id"], s["uploaded_at"], s["source_filename"], s["generation_date"] or "n/a",
                 f"{s['period_min']}–{s['period_max']}", s["row_count"],
             ))
         self.batch_tree.delete(*self.batch_tree.get_children())
         for b in db.list_purchase_batches(self.current_client_id):
             self.batch_tree.insert("", "end", iid=str(b["batch_id"]), values=(
-                b["uploaded_at"], b["source_filename"], b["row_count"], b["new_rows"],
+                b["batch_id"], b["uploaded_at"], b["source_filename"], b["row_count"], b["new_rows"],
                 b["duplicate_rows_skipped"], b["conflict_rows"],
             ))
 
@@ -821,6 +875,11 @@ class App(tk.Tk):
             self.result_tree.heading("info", text="Result")
             self.result_tree.insert("", "end", values=("No rows in this category.",))
             return
+        spec = _CATEGORY_COLUMNS.get(cat)
+        if spec:
+            cols, rename = spec
+            cols = [c for c in cols if c in df.columns]
+            df = df[cols].rename(columns=rename)
         display_cols = list(df.columns)[:12]
         self.result_tree["columns"] = display_cols
         for c in display_cols:
