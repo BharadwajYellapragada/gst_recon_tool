@@ -9,6 +9,7 @@ Layout:
 import os
 import sys
 import json
+import ctypes
 import subprocess
 import traceback
 import tkinter as tk
@@ -18,6 +19,33 @@ from datetime import datetime
 from . import db, parsers, reconcile, report, service, security, licensing
 
 APP_TITLE = "GST Reconciliation Tool"
+
+
+def _enable_dpi_awareness():
+    """Without this, Windows bitmap-stretches the whole window on scaled displays,
+    which mangles ttk widgets (buttons, tabs) rendered natively via the theme
+    engine — their text comes out garbled/missing while plain Tk-drawn text is
+    unaffected. Must run once, before any Tk root is created."""
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def _apply_dpi_scaling(root):
+    """Once the process opts out of Windows' bitmap-stretching (see
+    _enable_dpi_awareness), Tk must scale its own fonts/widgets to match the
+    real display DPI or the UI renders tiny on high-DPI screens."""
+    try:
+        dpi = root.winfo_fpixels("1i")
+        root.tk.call("tk", "scaling", dpi / 72.0)
+    except Exception:
+        pass
 
 
 def icon_path():
@@ -59,6 +87,7 @@ class ActivationScreen(tk.Tk):
 
     def __init__(self):
         super().__init__()
+        _apply_dpi_scaling(self)
         self.title(APP_TITLE)
         self.geometry("560x400")
         self.resizable(False, False)
@@ -120,6 +149,7 @@ class LoginScreen(tk.Tk):
 
     def __init__(self):
         super().__init__()
+        _apply_dpi_scaling(self)
         self.title(APP_TITLE)
         self.geometry("420x260")
         self.resizable(False, False)
@@ -271,6 +301,7 @@ class ConflictResolutionDialog(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        _apply_dpi_scaling(self)
         self.title(APP_TITLE)
         self.geometry("1180x720")
         self.minsize(1000, 620)
@@ -447,7 +478,7 @@ class App(tk.Tk):
         ttk.Label(t, text="Each upload is kept as a dated snapshot — nothing is overwritten, "
                           "so you can track suppliers filing late over the following months.",
                   foreground="#595959").pack(anchor="w", pady=(0, 6))
-        self.upload_g2a_btn = ttk.Button(t, text="Select GSTR-2A file (.xls/.xlsx)...",
+        self.upload_g2a_btn = ttk.Button(t, text="Select GSTR-2A file(s) (.xls/.xlsx)...",
                                           command=self._upload_gstr2a, state="disabled")
         self.upload_g2a_btn.pack(anchor="w", pady=(0, 16))
 
@@ -459,7 +490,7 @@ class App(tk.Tk):
                           "invoice with a DIFFERENT amount is held as a pending conflict for review "
                           "(see the 'Resolve Pending Conflicts' button above).",
                   foreground="#595959", wraplength=900, justify="left").pack(anchor="w", pady=(0, 6))
-        self.upload_pr_btn = ttk.Button(t, text="Select Purchase Register file (.xls/.xlsx)...",
+        self.upload_pr_btn = ttk.Button(t, text="Select Purchase Register file(s) (.xls/.xlsx)...",
                                          command=self._upload_purchase, state="disabled")
         self.upload_pr_btn.pack(anchor="w", pady=(0, 16))
 
@@ -475,56 +506,84 @@ class App(tk.Tk):
         widget.configure(state="disabled")
 
     def _upload_gstr2a(self):
-        path = filedialog.askopenfilename(
-            title="Select GSTR-2A file",
+        paths = filedialog.askopenfilenames(
+            title="Select GSTR-2A file(s)",
             filetypes=[("Excel files", "*.xls *.xlsx"), ("All files", "*.*")],
         )
-        if not path:
+        if not paths:
             return
-        try:
-            df, gen_date = parsers.parse_gstr2a(path)
-            snap_id = db.add_gstr2a_snapshot(self.current_client_id, os.path.basename(path), gen_date, df)
-            periods = sorted(df["Period"].unique())
-            self._log(self.upload_log,
-                       f"GSTR-2A loaded: {len(df)} invoice rows, periods {periods[0]}–{periods[-1]}, "
-                       f"portal generation date {gen_date or 'n/a'}. Saved as snapshot #{snap_id}.")
-            messagebox.showinfo("GSTR-2A uploaded",
-                                 f"{len(df)} invoice rows saved as a new snapshot.\n\n"
-                                 f"Periods covered: {periods[0]} to {periods[-1]}")
-        except parsers.ParseError as e:
-            messagebox.showerror("Could not read file", str(e))
-        except Exception as e:
-            messagebox.showerror("Unexpected error", f"{e}\n\n{traceback.format_exc()[-800:]}")
-            return
+        total_rows = 0
+        all_periods = []
+        errors = []
+        for path in paths:
+            try:
+                df, gen_date = parsers.parse_gstr2a(path)
+                snap_id = db.add_gstr2a_snapshot(self.current_client_id, os.path.basename(path), gen_date, df)
+                periods = sorted(df["Period"].unique())
+                all_periods.extend(periods)
+                total_rows += len(df)
+                self._log(self.upload_log,
+                           f"{os.path.basename(path)}: {len(df)} invoice rows, periods {periods[0]}–{periods[-1]}, "
+                           f"portal generation date {gen_date or 'n/a'}. Saved as snapshot #{snap_id}.")
+            except parsers.ParseError as e:
+                errors.append(f"{os.path.basename(path)}: {e}")
+                self._log(self.upload_log, f"{os.path.basename(path)}: FAILED — {e}")
+            except Exception as e:
+                errors.append(f"{os.path.basename(path)}: {e}")
+                self._log(self.upload_log, f"{os.path.basename(path)}: FAILED — {e}\n{traceback.format_exc()[-800:]}")
+
+        if all_periods:
+            msg = (f"{len(paths)} file(s) selected, {total_rows} invoice rows saved as new snapshots.\n\n"
+                   f"Periods covered: {min(all_periods)} to {max(all_periods)}")
+        else:
+            msg = "No files were successfully processed."
+        if errors:
+            msg += "\n\nThe following file(s) failed:\n" + "\n".join(errors)
+            messagebox.showwarning("GSTR-2A uploaded with errors", msg)
+        else:
+            messagebox.showinfo("GSTR-2A uploaded", msg)
         self._refresh_history_tab()
         self._refresh_recon_tab()
 
     def _upload_purchase(self):
-        path = filedialog.askopenfilename(
-            title="Select Purchase Register file",
+        paths = filedialog.askopenfilenames(
+            title="Select Purchase Register file(s)",
             filetypes=[("Excel files", "*.xls *.xlsx"), ("All files", "*.*")],
         )
-        if not path:
+        if not paths:
             return
-        try:
-            entries = parsers.parse_purchase_register(path)
-            result = db.add_purchase_batch(self.current_client_id, os.path.basename(path), entries)
-            self._log(self.upload_log,
-                       f"Purchase Register file processed: {result['total_in_file']} rows read → "
-                       f"{result['new_rows']} new, {result['duplicate_rows_skipped']} already stored (skipped), "
-                       f"{result['pending_conflicts']} flagged as amount conflicts for review.")
-            msg = (f"{result['new_rows']} new entries added.\n"
-                   f"{result['duplicate_rows_skipped']} rows were already in the system and skipped.\n")
-            if result["pending_conflicts"]:
-                msg += (f"\n{result['pending_conflicts']} entries have the same invoice number as one already "
-                        f"stored but a DIFFERENT amount. Use 'Resolve Pending Conflicts' above before "
-                        f"relying on totals — these are excluded from reconciliation until resolved.")
+        total_new = total_skipped = total_conflicts = 0
+        errors = []
+        for path in paths:
+            try:
+                entries = parsers.parse_purchase_register(path)
+                result = db.add_purchase_batch(self.current_client_id, os.path.basename(path), entries)
+                self._log(self.upload_log,
+                           f"{os.path.basename(path)}: {result['total_in_file']} rows read → "
+                           f"{result['new_rows']} new, {result['duplicate_rows_skipped']} already stored (skipped), "
+                           f"{result['pending_conflicts']} flagged as amount conflicts for review.")
+                total_new += result["new_rows"]
+                total_skipped += result["duplicate_rows_skipped"]
+                total_conflicts += result["pending_conflicts"]
+            except parsers.ParseError as e:
+                errors.append(f"{os.path.basename(path)}: {e}")
+                self._log(self.upload_log, f"{os.path.basename(path)}: FAILED — {e}")
+            except Exception as e:
+                errors.append(f"{os.path.basename(path)}: {e}")
+                self._log(self.upload_log, f"{os.path.basename(path)}: FAILED — {e}\n{traceback.format_exc()[-800:]}")
+
+        msg = (f"{len(paths)} file(s) selected.\n"
+               f"{total_new} new entries added.\n"
+               f"{total_skipped} rows were already in the system and skipped.\n")
+        if total_conflicts:
+            msg += (f"\n{total_conflicts} entries have the same invoice number as one already "
+                    f"stored but a DIFFERENT amount. Use 'Resolve Pending Conflicts' above before "
+                    f"relying on totals — these are excluded from reconciliation until resolved.")
+        if errors:
+            msg += "\n\nThe following file(s) failed:\n" + "\n".join(errors)
+            messagebox.showwarning("Purchase Register uploaded with errors", msg)
+        else:
             messagebox.showinfo("Purchase Register uploaded", msg)
-        except parsers.ParseError as e:
-            messagebox.showerror("Could not read file", str(e))
-        except Exception as e:
-            messagebox.showerror("Unexpected error", f"{e}\n\n{traceback.format_exc()[-800:]}")
-            return
         self._refresh_history_tab()
         self._refresh_recon_tab()
 
@@ -765,6 +824,7 @@ class App(tk.Tk):
 
 
 def main():
+    _enable_dpi_awareness()
     if not licensing.is_activated():
         activation = ActivationScreen()
         activation.mainloop()
