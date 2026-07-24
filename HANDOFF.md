@@ -64,6 +64,32 @@ screenshots, saved under `debug/` — gitignored, user's own working files).
    fixing already-uploaded snapshots stuck at n/a. New db function:
    `update_snapshot_generation_date(snapshot_id, generation_date)`.
 
+5. **v1.1.3 — installer "Start fresh" option.** New `[Tasks]` checkbox in
+   `installer.iss`, unchecked by default: "Start fresh — do NOT carry forward
+   clients, uploads, or reports saved by a previous install on this computer."
+   When checked, a `[Code]` `CurStepChanged(ssPostInstall)` handler archives
+   (timestamped rename, matching `security.reset_password_lock()`'s existing
+   behavior/naming — not a delete) `security.json` and `gst_recon.db.enc` under
+   `%LOCALAPPDATA%\GSTReconTool\`, forcing a fresh PIN setup on next launch.
+   Deliberately does NOT touch `license.json` (the activation key) — verified
+   by reading `licensing.py`: activation is keyed purely to
+   `security.get_machine_fingerprint()`, stored in its own file, with no
+   dependency on the password-derived key or the encrypted DB, so re-activation
+   is never required by a fresh start. Confirmation `MsgBox` before proceeding
+   (`NextButtonClick` on the tasks page) since this is a real, if archived-not-
+   deleted, action a user could trigger by mistake. Verified the Pascal script
+   compiles cleanly (ISCC does real semantic checks, not just syntax — caught
+   an invalid `sLineBreak` identifier during iteration) but could NOT
+   dynamically test the compiled installer's actual run behavior: Windows
+   Defender quarantined a disposable unsigned test build as a
+   "virus/potentially unwanted software" before it could even execute — a
+   live, first-hand demonstration of the exact SmartScreen/AV reputation
+   problem flagged in the deferred app-redesign discussion below. **If
+   anything about the fresh-start checkbox misbehaves in practice, that's the
+   one piece of this change that only got static verification, not a live
+   run — worth a manual click-through test before relying on it with a real
+   client machine.**
+
 ### Deferred: broader app redesign discussion
 
 User asked about converting the whole tool into a "proper Windows app" — native
