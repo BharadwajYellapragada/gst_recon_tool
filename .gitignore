@@ -10,4 +10,5 @@ installer_output/*
 vendor_tools/vendor_private_key.pem
 .idea/
 sample_data/
+debug/
 

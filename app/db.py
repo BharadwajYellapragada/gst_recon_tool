@@ -399,6 +399,20 @@ def list_snapshots(client_id):
     ).fetchall()
 
 
+def update_snapshot_generation_date(snapshot_id, generation_date):
+    """Manually sets/corrects a snapshot's portal generation date. Some GSTR-2B
+    exports don't include the 'Read me' sheet the date is normally read from (a
+    portal export-format difference, not a parsing failure) -- this lets the user
+    fill it in by hand instead of it sitting at 'n/a' forever."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE gstr2a_snapshots SET generation_date=? WHERE snapshot_id=?",
+        (generation_date.strip(), snapshot_id),
+    )
+    conn.commit()
+    persist()
+
+
 def get_snapshot_invoices(snapshot_id):
     import pandas as pd
     return pd.read_sql_query(

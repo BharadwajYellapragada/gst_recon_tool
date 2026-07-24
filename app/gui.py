@@ -14,7 +14,7 @@ import subprocess
 import traceback
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import matplotlib
@@ -87,12 +87,20 @@ def format_inr_short(value):
     return f"{sign}₹{value:.0f}"
 
 APP_TITLE = "GST Reconciliation Tool"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 # User-facing release notes, newest first. Shown in-app via the "What's New"
 # button (see ChangelogWindow) so the user has a reference without needing to
 # read HANDOFF.md (which is a dev/session log, not meant for the end user).
 CHANGELOG = [
+    ("1.1.2", "Note-matching fixes", [
+        "Credit Note Register rows that are actually sales-side entries (a 'GST Sales' "
+        "value present) are now excluded from purchase-side reconciliation, instead of "
+        "showing up as false unmatched rows.",
+        "GSTR-2B files that don't carry a portal generation date (some export variants "
+        "omit it) can now have it entered manually — at upload time, or later via "
+        "'Set Generation Date...' in the History tab.",
+    ]),
     ("1.1.1", "Conflict details + What's New", [
         "Pending-conflict screens (both in the app and in the exported Excel report) now show "
         "the supplier/party name (Particulars), not just GSTIN and invoice/voucher number.",
@@ -643,6 +651,88 @@ class ConflictResolutionDialog(tk.Toplevel):
             self.on_close()
 
 
+class GenerationDateDialog(tk.Toplevel):
+    """Lets the user manually fill in a GSTR-2B snapshot's portal generation date
+    when it couldn't be read from the file (some portal export variants omit the
+    'Read me' sheet that normally carries it — not a parsing failure, the data
+    just isn't in that file). One row per snapshot, so a multi-file upload where
+    several files are missing it can be filled in a single dialog instead of one
+    popup per file. Also reused by History's 'Set Generation Date' action for
+    already-uploaded snapshots still sitting at n/a."""
+
+    def __init__(self, parent, snapshots, on_save=None):
+        """snapshots: list of dicts with keys snapshot_id, filename, current (str, may be '')."""
+        super().__init__(parent)
+        self.on_save = on_save
+        self.title("Set Portal Generation Date")
+        height = min(600, 210 + 46 * len(snapshots))
+        self.geometry(f"640x{height}")
+        self.resizable(False, True)
+        self.transient(parent)
+        set_app_icon(self)
+        self.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        x = px + max(0, (pw - 640) // 2)
+        y = py + max(0, (ph - height) // 3)
+        self.geometry(f"+{x}+{y}")
+
+        ttk.Label(self, text="These file(s) don't include a portal generation date (the export "
+                             "didn't carry a 'Read me' sheet). Enter it if you know it — format "
+                             "DD/MM/YYYY, or use the quick buttons — or leave blank to keep showing n/a.",
+                  style="Muted.TLabel", wraplength=600, justify="left", padding=10).pack(anchor="w")
+
+        today_str = datetime.now().strftime("%d/%m/%Y")
+        yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%d/%m/%Y")
+
+        rows_frame = ttk.Frame(self, padding=(10, 0))
+        rows_frame.pack(fill="both", expand=True)
+        self._entries = []
+        for snap in snapshots:
+            row = ttk.Frame(rows_frame)
+            row.pack(fill="x", pady=4)
+            ttk.Label(row, text=snap["filename"], width=28).pack(side="left")
+            var = tk.StringVar(value=snap.get("current", "") or "")
+            ttk.Entry(row, textvariable=var, width=12).pack(side="left", padx=(6, 6))
+            ttk.Button(row, text="Today", width=8,
+                       command=lambda v=var: v.set(today_str)).pack(side="left")
+            ttk.Button(row, text="Yesterday", width=10,
+                       command=lambda v=var: v.set(yesterday_str)).pack(side="left", padx=(4, 0))
+            self._entries.append((snap["snapshot_id"], var))
+
+        btns = ttk.Frame(self, padding=10)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Save", command=self._save).pack(side="right")
+        ttk.Button(btns, text="Skip", command=self.destroy).pack(side="right", padx=(0, 6))
+        self.grab_set()
+
+    def _save(self):
+        import datetime as _dt
+        bad = []
+        for snapshot_id, var in self._entries:
+            text = var.get().strip()
+            if not text:
+                continue
+            try:
+                _dt.datetime.strptime(text, "%d/%m/%Y")
+            except ValueError:
+                bad.append(text)
+        if bad:
+            messagebox.showwarning(
+                "Invalid date", f"Couldn't understand: {', '.join(bad)}\nUse DD/MM/YYYY, e.g. 14/10/2025.",
+                parent=self,
+            )
+            return
+        for snapshot_id, var in self._entries:
+            text = var.get().strip()
+            if text:
+                db.update_snapshot_generation_date(snapshot_id, text)
+        self.grab_release()
+        self.destroy()
+        if self.on_save:
+            self.on_save()
+
+
 # Sheet names report.py writes, in the order the picker should offer them
 # (Summary is deliberately excluded — it's freeform letterhead text, not a table).
 _REPORT_SHEET_ORDER = ["Value_Tax_Mismatches", "Probable_Matches", "Only_In_GSTR2A",
@@ -1137,6 +1227,7 @@ class App(tk.Tk):
         total_notes = 0
         all_periods = []
         errors = []
+        missing_gen_date = []
         for path in paths:
             try:
                 df, gen_date = parsers.parse_gstr2a(path)
@@ -1153,6 +1244,8 @@ class App(tk.Tk):
                 self._log(self.upload_log,
                            f"{os.path.basename(path)}: {len(df)} invoice rows{note_msg}, periods {periods[0]}–{periods[-1]}, "
                            f"portal generation date {gen_date or 'n/a'}. Saved as snapshot #{snap_id}.")
+                if not gen_date:
+                    missing_gen_date.append({"snapshot_id": snap_id, "filename": os.path.basename(path), "current": ""})
             except parsers.ParseError as e:
                 errors.append(f"{os.path.basename(path)}: {e}")
                 self._log(self.upload_log, f"{os.path.basename(path)}: FAILED — {e}")
@@ -1172,6 +1265,8 @@ class App(tk.Tk):
             messagebox.showinfo("GSTR-2A uploaded", msg)
         self._refresh_history_tab()
         self._refresh_recon_tab()
+        if missing_gen_date:
+            GenerationDateDialog(self, missing_gen_date, on_save=self._refresh_history_tab)
 
     def _upload_purchase(self):
         paths = filedialog.askopenfilenames(
@@ -1270,6 +1365,7 @@ class App(tk.Tk):
         snap_btns.pack(fill="x", pady=(0, 20))
         ttk.Button(snap_btns, text="Download Selected...", command=self._download_snapshot).pack(side="left")
         ttk.Button(snap_btns, text="Delete Selected", command=self._delete_snapshot).pack(side="left", padx=8)
+        ttk.Button(snap_btns, text="Set Generation Date...", command=self._set_generation_date).pack(side="left")
 
         ttk.Label(t, text="Purchase Register Upload Batches", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
         cols2 = ("Batch #", "Uploaded", "File", "Rows in File", "New", "Skipped (dup)", "Pending Conflicts")
@@ -1348,6 +1444,17 @@ class App(tk.Tk):
         db.delete_gstr2a_snapshot(snapshot_id)
         self._refresh_history_tab()
         self._refresh_recon_tab()
+
+    def _set_generation_date(self):
+        sel = self.snap_tree.selection()
+        if not sel:
+            messagebox.showwarning("Nothing selected", "Select one or more snapshots first.")
+            return
+        selected_ids = {int(iid) for iid in sel}
+        snaps = [s for s in db.list_snapshots(self.current_client_id) if s["snapshot_id"] in selected_ids]
+        entries = [{"snapshot_id": s["snapshot_id"], "filename": s["source_filename"],
+                    "current": s["generation_date"] or ""} for s in snaps]
+        GenerationDateDialog(self, entries, on_save=self._refresh_history_tab)
 
     def _download_batch(self):
         sel = self.batch_tree.selection()

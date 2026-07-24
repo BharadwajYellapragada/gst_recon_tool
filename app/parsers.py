@@ -542,6 +542,7 @@ def parse_note_register(path, note_type):
     i_refdate = col_idx("Voucher Ref. Date", "Voucher Ref Date")
     i_gstin = col_idx("GSTIN/UIN", "GSTIN")
     i_gross = col_idx("Gross Total")
+    i_gst_sales = col_idx("GST Sales")
 
     if None in (i_date, i_refno, i_gstin, i_gross):
         raise ParseError(
@@ -559,6 +560,14 @@ def parse_note_register(path, note_type):
         if row is None:
             continue
         if i_date >= len(row):
+            continue
+        # A populated 'GST Sales' ledger column means this voucher was posted
+        # against a sales-side account (e.g. a customer credit note), not a
+        # purchase-side one -- it has no counterpart in GSTR-2B's B2B-CDNR
+        # (which only covers inward supplies) and would otherwise show up as a
+        # false "only in Note Register" mismatch, so it's excluded here rather
+        # than left for the reconciliation step to misclassify.
+        if i_gst_sales is not None and i_gst_sales < len(row) and row[i_gst_sales] not in (None, ""):
             continue
         date_val = row[i_date]
         entry_date_obj = _to_pydate(date_val)
