@@ -87,12 +87,19 @@ def format_inr_short(value):
     return f"{sign}₹{value:.0f}"
 
 APP_TITLE = "GST Reconciliation Tool"
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 
 # User-facing release notes, newest first. Shown in-app via the "What's New"
 # button (see ChangelogWindow) so the user has a reference without needing to
 # read HANDOFF.md (which is a dev/session log, not meant for the end user).
 CHANGELOG = [
+    ("1.1.4", "Fixed: unable to set PIN on some displays", [
+        "On some displays (high-DPI/scaled screens), the first-run 'set a PIN' screen cut "
+        "off the Confirm PIN field and the button below the visible window, with no way to "
+        "resize or scroll to reach them — blocking first-time setup entirely. The Activation "
+        "screen and Add Client dialog had the same latent issue. All three now size themselves "
+        "to fit their actual content correctly at any display scaling.",
+    ]),
     ("1.1.3", "Installer: start-fresh option", [
         "The installer now offers an opt-in ‘Start fresh’ checkbox (unchecked by "
         "default) for setting up on a computer that has an older install's data still on "
@@ -285,6 +292,22 @@ def _apply_dpi_scaling(root):
         pass
 
 
+def _fit_window_to_content(window, min_w=0, min_h=0):
+    """Sizes a fixed, non-resizable window to its ACTUAL required size instead
+    of a hardcoded pixel guess. A hardcoded '440x300'-style geometry is a raw
+    pixel count that _apply_dpi_scaling knows nothing about -- on a high-DPI
+    display, scaling inflates every widget's real on-screen size, so content
+    that fit at 100% scaling silently overflows past the bottom of a fixed,
+    non-resizable window (buttons/fields below the fold, unreachable, with no
+    scrollbar and no way to resize into view). Call this after packing every
+    widget, in place of a hardcoded geometry() call, on any Tk/Toplevel using
+    resizable(False, False) or resizable(False, True)."""
+    window.update_idletasks()
+    w = max(window.winfo_reqwidth(), min_w)
+    h = max(window.winfo_reqheight(), min_h)
+    window.geometry(f"{w}x{h}")
+
+
 UI_FONT = "Segoe UI"
 
 
@@ -440,7 +463,6 @@ class ActivationScreen(tk.Tk):
         _apply_dpi_scaling(self)
         _configure_style(self)
         self.title(APP_TITLE)
-        self.geometry("580x420")
         self.resizable(False, False)
         set_app_icon(self)
         self.activated = False
@@ -475,6 +497,8 @@ class ActivationScreen(tk.Tk):
 
         ttk.Button(frame, text="Activate", command=self._submit).pack(anchor="e")
 
+        _fit_window_to_content(self, min_w=580)
+
     def _copy_fingerprint(self):
         self.clipboard_clear()
         self.clipboard_append(self.fp_var.get())
@@ -503,7 +527,6 @@ class LoginScreen(tk.Tk):
         _apply_dpi_scaling(self)
         _configure_style(self)
         self.title(APP_TITLE)
-        self.geometry("440x300")
         self.resizable(False, False)
         set_app_icon(self)
         self.unlocked = False
@@ -545,6 +568,8 @@ class LoginScreen(tk.Tk):
                   wraplength=390, justify="left").pack(anchor="w", pady=(0, 10))
 
         ttk.Button(frame, text=btn_text, command=self._submit).pack(anchor="e")
+
+        _fit_window_to_content(self, min_w=440)
 
     def _submit(self):
         pin = self.pin_var.get()
@@ -672,17 +697,9 @@ class GenerationDateDialog(tk.Toplevel):
         super().__init__(parent)
         self.on_save = on_save
         self.title("Set Portal Generation Date")
-        height = min(600, 210 + 46 * len(snapshots))
-        self.geometry(f"640x{height}")
         self.resizable(False, True)
         self.transient(parent)
         set_app_icon(self)
-        self.update_idletasks()
-        px, py = parent.winfo_rootx(), parent.winfo_rooty()
-        pw, ph = parent.winfo_width(), parent.winfo_height()
-        x = px + max(0, (pw - 640) // 2)
-        y = py + max(0, (ph - height) // 3)
-        self.geometry(f"+{x}+{y}")
 
         ttk.Label(self, text="These file(s) don't include a portal generation date (the export "
                              "didn't carry a 'Read me' sheet). Enter it if you know it — format "
@@ -711,6 +728,16 @@ class GenerationDateDialog(tk.Toplevel):
         btns.pack(fill="x")
         ttk.Button(btns, text="Save", command=self._save).pack(side="right")
         ttk.Button(btns, text="Skip", command=self.destroy).pack(side="right", padx=(0, 6))
+
+        _fit_window_to_content(self, min_w=640)
+        self.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        w, h = self.winfo_width(), self.winfo_height()
+        x = px + max(0, (pw - w) // 2)
+        y = py + max(0, (ph - h) // 3)
+        self.geometry(f"+{x}+{y}")
+
         self.grab_set()
 
     def _save(self):
@@ -1093,7 +1120,6 @@ class App(tk.Tk):
     def _add_client_dialog(self):
         dlg = tk.Toplevel(self)
         dlg.title("Add Client")
-        dlg.geometry("400x210")
         dlg.resizable(False, False)
         dlg.transient(self)
         set_app_icon(dlg)
@@ -1118,6 +1144,7 @@ class App(tk.Tk):
             self._refresh_client_list()
 
         ttk.Button(dlg, text="Save", command=save).pack(pady=14)
+        _fit_window_to_content(dlg, min_w=400)
         dlg.grab_set()
 
     def _delete_client(self):
