@@ -87,12 +87,19 @@ def format_inr_short(value):
     return f"{sign}₹{value:.0f}"
 
 APP_TITLE = "GST Reconciliation Tool"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 
 # User-facing release notes, newest first. Shown in-app via the "What's New"
 # button (see ChangelogWindow) so the user has a reference without needing to
 # read HANDOFF.md (which is a dev/session log, not meant for the end user).
 CHANGELOG = [
+    ("1.1.3", "Installer: start-fresh option", [
+        "The installer now offers an opt-in ‘Start fresh’ checkbox (unchecked by "
+        "default) for setting up on a computer that has an older install's data still on "
+        "it. When checked, previous clients/uploads/reports are archived aside (not "
+        "permanently deleted) so a new PIN can be set up from scratch. Your activation key "
+        "is never affected either way.",
+    ]),
     ("1.1.2", "Note-matching fixes", [
         "Credit Note Register rows that are actually sales-side entries (a 'GST Sales' "
         "value present) are now excluded from purchase-side reconciliation, instead of "
