@@ -87,6 +87,58 @@ def format_inr_short(value):
     return f"{sign}₹{value:.0f}"
 
 APP_TITLE = "GST Reconciliation Tool"
+APP_VERSION = "1.1.1"
+
+# User-facing release notes, newest first. Shown in-app via the "What's New"
+# button (see ChangelogWindow) so the user has a reference without needing to
+# read HANDOFF.md (which is a dev/session log, not meant for the end user).
+CHANGELOG = [
+    ("1.1.1", "Conflict details + What's New", [
+        "Pending-conflict screens (both in the app and in the exported Excel report) now show "
+        "the supplier/party name (Particulars), not just GSTIN and invoice/voucher number.",
+        "Added this “What's New” viewer.",
+    ]),
+    ("1.1.0", "Credit/Debit Note reconciliation", [
+        "Upload your Tally Credit Note Register and Debit Note Register, and reconcile them "
+        "against the credit/debit notes in your GSTR-2B (the B2B-CDNR data) — the same way "
+        "invoices are already reconciled against GSTR-2A/2B.",
+        "New “Credit/Debit Notes” view under the Reconciliation tab.",
+        "Uploading GSTR-2A/2B now also picks up credit/debit notes from the same file "
+        "automatically — no extra upload step.",
+        "Fixed: some Purchase Register uploads were undercounting IGST depending on how the "
+        "IGST column was named in the export.",
+        "Fixed: a database upgrade issue that could affect existing installations.",
+    ]),
+    ("1.0.7", "Report viewer", [
+        "Double-click a past exported report to reopen it and see the same Insights/Details "
+        "view, without re-running reconciliation against possibly-changed data.",
+    ]),
+    ("1.0.6", "Insights charts", [
+        "New Insights sub-tab with KPI tiles and charts (category breakdown, monthly totals, "
+        "top suppliers not yet in GSTR-2A/2B).",
+        "All currency now shown in Indian digit grouping (₹54,25,630 style).",
+        "App now launches maximized.",
+    ]),
+    ("1.0.5", "Cleaner look", [
+        "Restyled the whole app for a cleaner, more readable look; tables now scroll instead "
+        "of clipping long values.",
+    ]),
+    ("1.0.4", "Reconciliation preview fixes", [
+        "Fixed some reconciliation categories showing blank/NaN values in the on-screen preview.",
+        "History tables now show a Snapshot/Batch number for easier reference.",
+    ]),
+    ("1.0.3", "GSTR-2B support", [
+        "GSTR-2B portal exports are now supported alongside GSTR-2A.",
+        "Added Download/Delete for uploaded snapshots and Purchase Register batches.",
+    ]),
+    ("1.0.2", "High-DPI fix", [
+        "Fixed garbled/blank button text on high-DPI displays.",
+        "Upload buttons now support selecting multiple files at once.",
+    ]),
+    ("1.0.1", "Purchase Register upload fix", [
+        "Fixed Purchase Register uploads being rejected with “No valid data rows were found.”",
+    ]),
+]
 
 # Mirrors report.py's per-category column choices: the raw reconciliation
 # DataFrames are outer-merge results carrying BOTH sides' columns (g2a_agg's
@@ -528,7 +580,7 @@ class ConflictResolutionDialog(tk.Toplevel):
                              "each one — Overwrite uses the new upload, Ignore keeps the stored value.",
                   style="Muted.TLabel", wraplength=1000, justify="left", padding=10).pack(anchor="w")
 
-        cols = (ref_field, "GSTIN", "Stored Gross", "New Gross", "Stored CGST", "New CGST",
+        cols = (ref_field, "Particulars", "GSTIN", "Stored Gross", "New Gross", "Stored CGST", "New CGST",
                 "Stored SGST", "New SGST", "Stored IGST", "New IGST")
         tree_container, self.tree = _make_scrollable_tree(self, cols, height=14)
         tree_container.pack(fill="both", expand=True, padx=10)
@@ -555,7 +607,7 @@ class ConflictResolutionDialog(tk.Toplevel):
         for item in self._rows:
             p, s = item["pending"], item["stored"]
             self.tree.insert("", "end", iid=str(p["id"]), values=(
-                p[ref_key], p["gstin"],
+                p[ref_key], p["particulars"], p["gstin"],
                 s["gross_total"] if s else "n/a", p["gross_total"],
                 s["cgst"] if s else "n/a", p["cgst"],
                 s["sgst"] if s else "n/a", p["sgst"],
@@ -787,11 +839,47 @@ class ReportViewerWindow(tk.Toplevel):
         canvas2.draw()
 
 
+class ChangelogWindow(tk.Toplevel):
+    """Read-only 'What's New' viewer over the CHANGELOG constant above — lets the
+    user see release notes without leaving the app or hunting for a GitHub page."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title(f"What's New — {APP_TITLE}")
+        self.geometry("640x560")
+        self.transient(parent)
+        set_app_icon(self)
+
+        ttk.Label(self, text=f"{APP_TITLE}  —  currently v{APP_VERSION}",
+                  style="Header.TLabel", padding=(14, 12, 14, 4)).pack(anchor="w")
+
+        text_frame = ttk.Frame(self, padding=(14, 0, 14, 14))
+        text_frame.pack(fill="both", expand=True)
+        text = tk.Text(text_frame, wrap="word", state="normal", relief="flat",
+                        bg="#FFFFFF", font=(UI_FONT, 10), padx=8, pady=8)
+        vsb = ttk.Scrollbar(text_frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=vsb.set)
+        text.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        text.tag_configure("version", font=(UI_FONT, 12, "bold"), foreground="#1F4E78", spacing3=4)
+        text.tag_configure("bullet", font=(UI_FONT, 10), lmargin1=14, lmargin2=28, spacing1=2, spacing3=6)
+        for version, title, notes in CHANGELOG:
+            text.insert("end", f"v{version} — {title}\n", "version")
+            for note in notes:
+                text.insert("end", f"• {note}\n", "bullet")
+            text.insert("end", "\n")
+        text.configure(state="disabled")
+
+        ttk.Button(self, text="Close", command=self.destroy).pack(pady=(0, 12))
+        self.grab_set()
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         _apply_dpi_scaling(self)
-        self.title(APP_TITLE)
+        self.title(f"{APP_TITLE}  v{APP_VERSION}")
         self.geometry("1360x800")
         self.minsize(1080, 660)
         set_app_icon(self)
@@ -847,6 +935,7 @@ class App(tk.Tk):
         header_row.pack(fill="x", pady=(0, 8))
         self.header_var = tk.StringVar(value="Select or add a client to begin")
         ttk.Label(header_row, textvariable=self.header_var, style="Title.TLabel").pack(side="left")
+        ttk.Button(header_row, text="What's New", command=lambda: ChangelogWindow(self)).pack(side="left", padx=(14, 0))
         self.note_conflicts_btn = ttk.Button(header_row, text="Resolve Note Conflicts",
                                               command=self._open_note_conflicts_dialog, state="disabled")
         self.note_conflicts_btn.pack(side="right")

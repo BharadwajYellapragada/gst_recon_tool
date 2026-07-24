@@ -335,7 +335,7 @@ def build_report(client_name, client_gstin, snapshot_info, purchase_asof, result
                      "stored. They are excluded from every figure in this report until you resolve "
                      "each one as Overwrite (use the new value) or Ignore (keep the stored value).")
         wsP["A1"].font = SUB_FONT
-        cols = ["GSTIN", "Invoice No", "Stored: Gross Total", "New Upload: Gross Total",
+        cols = ["GSTIN", "Particulars", "Invoice No", "Stored: Gross Total", "New Upload: Gross Total",
                 "Stored: CGST", "New Upload: CGST", "Stored: SGST", "New Upload: SGST",
                 "Stored: IGST", "New Upload: IGST", "Pending Entry ID (for resolving)"]
         for j, c in enumerate(cols, start=1):
@@ -344,7 +344,7 @@ def build_report(client_name, client_gstin, snapshot_info, purchase_asof, result
         r = 4
         for item in pending:
             p, s = item["pending"], item["stored"]
-            vals = [p["gstin"], p["invoice_no"],
+            vals = [p["gstin"], p["particulars"], p["invoice_no"],
                     s["gross_total"] if s else "", p["gross_total"],
                     s["cgst"] if s else "", p["cgst"],
                     s["sgst"] if s else "", p["sgst"],
@@ -486,7 +486,7 @@ def _write_note_sheets(wb, note_results):
                      "already stored. They are excluded from every figure in this report until you "
                      "resolve each one as Overwrite (use the new value) or Ignore (keep the stored value).")
         wsP["A1"].font = SUB_FONT
-        cols = ["GSTIN", "Voucher No", "Stored: Gross Total", "New Upload: Gross Total",
+        cols = ["GSTIN", "Particulars", "Voucher No", "Stored: Gross Total", "New Upload: Gross Total",
                 "Stored: CGST", "New Upload: CGST", "Stored: SGST", "New Upload: SGST",
                 "Stored: IGST", "New Upload: IGST", "Pending Entry ID (for resolving)"]
         for j, c in enumerate(cols, start=1):
@@ -495,7 +495,7 @@ def _write_note_sheets(wb, note_results):
         r = 4
         for item in pending:
             p, s = item["pending"], item["stored"]
-            vals = [p["gstin"], p["voucher_no"],
+            vals = [p["gstin"], p["particulars"], p["voucher_no"],
                     s["gross_total"] if s else "", p["gross_total"],
                     s["cgst"] if s else "", p["cgst"],
                     s["sgst"] if s else "", p["sgst"],

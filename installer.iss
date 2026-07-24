@@ -4,7 +4,7 @@
 ; uninstaller, Add/Remove Programs listing) around dist\GST-Reconciliation-Tool\.
 
 #define MyAppName "GST Reconciliation Tool"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.1.1"
 #define MyAppPublisher "Sai Srinivasa Bharadwaj"
 #define MyAppExeName "GST-Reconciliation-Tool.exe"
 
