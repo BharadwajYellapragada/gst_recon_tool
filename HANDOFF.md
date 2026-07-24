@@ -90,6 +90,100 @@ screenshots, saved under `debug/` — gitignored, user's own working files).
    run — worth a manual click-through test before relying on it with a real
    client machine.**
 
+6. **v1.1.4 — first-run PIN setup was completely blocked on some displays.**
+   User-reported with a screenshot: the "set a PIN" screen showed the title,
+   description, and "New PIN" field, then just... stopped. No "Confirm PIN"
+   field, no submit button. Root cause: `ActivationScreen` and `LoginScreen`
+   both used a hardcoded `.geometry("WxH")` pixel size with
+   `resizable(False, False)`. `_apply_dpi_scaling()` scales fonts/padding to
+   match the real display DPI, but never touches these hardcoded geometry
+   strings — on a scaled display, the actual content needs more vertical room
+   than the fixed window allows, silently pushing the bottom of the form below
+   the visible, non-resizable window with **no scrollbar and no way to
+   resize** into view. `_add_client_dialog` had the identical pattern
+   (same risk, not yet reported). Fixed with a new shared
+   `_fit_window_to_content(window, min_w, min_h)` helper — calls
+   `update_idletasks()` then sizes the window to its real `winfo_reqwidth()`/
+   `winfo_reqheight()` (which correctly reflects whatever the DPI scaling
+   actually produced) instead of a hardcoded guess, called after all widgets
+   are packed rather than before. Applied to `ActivationScreen`,
+   `LoginScreen`, `_add_client_dialog`, and (proactively, same latent risk
+   even though not reported) `GenerationDateDialog` from v1.1.2. Verified by
+   launching `LoginScreen` directly in first-run mode and screenshotting —
+   Confirm PIN + submit button both fully visible after the fix, confirming
+   the specific reported symptom is resolved.
+
+### In progress: pywebview-based UI redesign (separate `webapp/` folder)
+
+Picked up the deferred app-redesign discussion (see below) and got a decision:
+**keep the Python backend entirely untouched, rebuild the UI as an HTML/CSS/JS
+frontend running inside a `pywebview` window** (native OS window via
+Windows' WebView2/Edge-Chromium engine, no internet required, no browser
+chrome visible — looks like a native app). User's own idea, validated as a
+strong fit over the previously-discussed PySide6/qfluentwidgets option because
+HTML/CSS gives far more design flexibility for the "modern UI with animations/
+effects/notifications/icons" priority, while still reusing 100% of the
+existing business logic.
+
+**Hard constraint from the user: nothing in the existing `app/` folder, or any
+existing file, gets modified.** All new code lives in a new top-level
+`webapp/` folder (sibling to `app/`), which only *imports* `app.db`,
+`app.security`, `app.licensing` etc. as a library. The old Tkinter app
+(`main.py` -> `app/gui.py`) keeps working unmodified and un-touched throughout
+this rewrite — the two apps coexist until the new one is feature-complete.
+
+**Stack decided:**
+- Frontend: vanilla HTML/CSS/JS, no Node/build-step framework. Alpine.js
+  (vendored locally at `webapp/web/js/alpine.min.js`, fetched once via curl
+  during dev, ships offline) for reactivity without a bundler.
+- Charts: Chart.js planned for later phases (replacing matplotlib) for
+  animated/interactive charts — not yet added.
+- Icons: a small self-hosted subset of Lucide SVGs, inlined as JS template
+  strings in `webapp/web/js/icons.js` (`icon('name')` helper) — no CDN/font
+  dependency.
+- Bridge: pywebview's built-in `js_api` (`webapp/api.py`'s `Api` class) —
+  JS calls `pywebview.api.method_name(...)`, gets a Promise resolving to
+  whatever the Python method returns (JSON-serialized automatically). No
+  separate Flask/FastAPI server process.
+- Packaging: same PyInstaller pipeline as today, extended later to bundle
+  `webapp/web/*` as data files. `pywebview>=6.0` added to a *separate*
+  `webapp/requirements.txt` (not the root `requirements.txt`, to keep the two
+  apps' dependency lists cleanly separated during coexistence) — installed via
+  `pip install pywebview` into the same shared `.venv` (unavoidable single
+  touchpoint; doesn't modify any existing file).
+
+**Phased plan** (agreed with user, not yet all built):
+1. Foundation — pywebview shell, login/PIN + activation screens, client list +
+   nav frame, design system. **In progress, paused mid-Phase-1** for the
+   PIN-bug fix above (v1.1.4) — resume here.
+2. Upload tab + conflict-resolution dialogs
+3. History tab (all 3 tables + actions, incl. Set Generation Date)
+4. Reconciliation tab (FY selector, category tables, Credit/Debit Notes view,
+   Chart.js Insights)
+5. Past Reports tab + report viewer
+6. Changelog/activation dialog polish, animation pass, native notifications
+   (`winotify`, since web notifications inside an embedded webview don't
+   reliably reach the OS Action Center)
+7. Packaging + full regression test + release (this is when `main.py` would
+   actually switch over to the new app — not before)
+
+**What exists so far** (`webapp/`):
+- `requirements.txt` — `pywebview>=6.0`
+- `web/css/app.css` — full design system: light/dark CSS variables (brand
+  blue matches the existing report's `#1F4E78`), buttons/inputs/tables/
+  modals/toasts/badges, animations (`rise`/`pop`/`fade`/`toast-in`/`spin`)
+- `web/js/alpine.min.js` — vendored Alpine.js 3.14.1
+- `web/js/icons.js` — ~20 self-hosted Lucide icons
+- `api.py` — `Api` class, Phase-1 scope: `get_bootstrap_state()`,
+  `activate()`, `unlock()`, `list_clients()`, `add_client()`,
+  `delete_client()`. Deliberately duplicates a small `APP_VERSION`/changelog
+  concept rather than importing `app.gui`'s (importing `app.gui` would pull in
+  Tkinter + matplotlib just for two constants — not worth the weight for a
+  supposedly-decoupled new app).
+- **Not yet built**: `webapp/main.py` (pywebview window entry point),
+  `web/index.html`, `web/js/app.js` (the actual Alpine components for
+  activation/login/client-list screens). Phase 1 is NOT runnable yet.
+
 ### Deferred: broader app redesign discussion
 
 User asked about converting the whole tool into a "proper Windows app" — native
