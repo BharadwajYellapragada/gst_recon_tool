@@ -4,6 +4,92 @@ Picking this up in Claude Code. Read the session log first — it's the current
 state. The "Baseline" section below it is the original handoff from before
 this session and is mostly superseded (kept for product-decision history).
 
+## Session Log — 2026-07-24 continued (v1.1.0 → v1.1.2: post-release fixes)
+
+Same-day follow-up after the v1.1.0 credit/debit note feature shipped, driven by
+the user actually using it against real data and reporting issues (with
+screenshots, saved under `debug/` — gitignored, user's own working files).
+
+1. **v1.1.1** — Pending-conflict views (both `ConflictResolutionDialog` in the
+   GUI and the `Pending_Conflicts`/`Notes_Pending_Conflicts` Excel sheets) added
+   a Particulars/supplier-name column, since GSTIN + invoice/voucher number
+   alone wasn't enough to identify a conflict at a glance. Also added an in-app
+   "What's New" button/window (`ChangelogWindow`, backed by a `CHANGELOG`
+   constant in `gui.py`) plus an `APP_VERSION` constant shown in the title bar —
+   there was no in-app version/changelog visibility before this.
+
+2. **v1.1.2, bug report #1 — "GST Sales" rows falsely reconciled.** The user's
+   real Credit Note Register (and potentially Debit Note Register) contains
+   rows that are actually **sales-side** transactions (Tally exports every
+   ledger touched by that voucher type register, including a 'GST Sales'
+   column for rows unrelated to purchases). These were being parsed and
+   reconciled as if they were purchase-side notes, showing up as false
+   "only in Note Register" mismatches since GSTR-2B's B2B-CDNR only covers
+   inward supplies. Fixed in `parse_note_register`: any row with a populated
+   'GST Sales' cell is now skipped at parse time. Verified against the user's
+   real Credit Note Register file: excludes exactly 10 rows, all of which had
+   otherwise-valid GSTIN/date/refno (i.e. weren't already being dropped for
+   another reason).
+
+3. **v1.1.2, bug report #2 — a real GSTR-2B/Note Register match showed as
+   unmatched.** Root-caused by reproducing with the user's own files
+   (`sample_data/`): the pipeline logic itself was correct — the same voucher,
+   run in isolation against MAY-GSTR2B.xlsx + Credit Note Register, landed in
+   `matched_clean` as expected. The user's production database had multiple/
+   repeated GSTR-2B uploads for testing; re-uploading the correct file fixed it
+   (consistent with `get_merged_gstr2b_cdnr_notes`'s "latest snapshot wins"
+   dedup behaving as designed once given complete data). **No code changed for
+   this one** — confirmed working-as-intended, not a bug.
+
+4. **v1.1.2, bug report #3 — "Portal Generation Date" showing n/a.** Also
+   root-caused by inspecting the user's actual files: some GSTR-2B downloads
+   (`APR25-GSTR2B.xlsx`, `MAY-GSTR2B.xlsx`, and apparently `JUNE`/`DEC25` too)
+   genuinely have only `['B2B', 'B2B-CDNR']` sheets — **no 'Read me' sheet at
+   all** — while others (`SEP25`, `OCT25`, `JULY`, `MAR26`) do. This is a GST
+   portal export-format difference (the user confirmed: "some clients opt for
+   the new format, some stayed with the old one"), not a parsing bug — checked
+   both the B2B sheet's own header rows and the xlsx file's core.xml properties
+   for a recoverable date; neither carries it (core.xml `created`/`modified`
+   just reflects local file-copy time, not the portal's generation event, so
+   it's actively misleading and was NOT used). Considered inferring an
+   approximate date from the max `GSTR-1/IFF/GSTR-5 Filing Date` across rows
+   (would land within ~1-2 days of the real generation date based on the
+   sample data) but the user suggested manual entry instead — simpler and
+   doesn't risk a silently-wrong inferred value. Built `GenerationDateDialog`:
+   prompts (batched, one dialog per multi-file upload rather than one popup per
+   file) when a GSTR-2A/2B upload is missing the date, with "Today"/
+   "Yesterday" quick-fill buttons per row since that's very likely correct for
+   how these files get downloaded and immediately uploaded. Also added a
+   "Set Generation Date..." button in the History tab's snapshot section for
+   fixing already-uploaded snapshots stuck at n/a. New db function:
+   `update_snapshot_generation_date(snapshot_id, generation_date)`.
+
+### Deferred: broader app redesign discussion
+
+User asked about converting the whole tool into a "proper Windows app" — native
+modern UI (animations/effects/notifications/icons), plus fixing the Windows
+SmartScreen "Don't run" warning that's a real concern given the app is shared
+with finance-industry users professionally. Discussed but **not decided or
+started**:
+- SmartScreen fix requires code signing; EV certificate (~$300-600/yr, instant
+  trust) is the clean fix, Microsoft Trusted Signing (~$10/mo) is a cheaper
+  maybe-eligible alternative, Microsoft Store/MSIX distribution sidesteps it
+  entirely but needs Windows 10+ (incompatible with Win7 support).
+- User has now said Windows 7 compatibility can be dropped — modern UI/UX
+  (animations, notifications, icons) matters more. This opens up MSIX
+  packaging and Qt6/Fluent-capable toolkits that were previously ruled out.
+- Recommended keeping the Python backend (all the hard-won parsing/reconcile/
+  security logic) and only replacing the GUI layer with PySide6 +
+  `qfluentwidgets` (a Fluent Design clone for Qt) rather than a full native
+  C#/WinUI3 rewrite — lower risk, faster, keeps everything already
+  battle-tested. Not yet confirmed by the user.
+- Also floated additional finance-team features as a separate track (TDS
+  reconciliation, GSTR-3B vs GSTR-1 vs books 3-way ITC check, bank statement
+  reconciliation, compliance due-date calendar) — not prioritized yet.
+- **Next session: pick up this thread** — needs the user's decision on UI
+  framework, distribution/signing approach, and which (if any) new feature
+  modules to build, before any implementation starts.
+
 ## Session Log — 2026-07-24 (v1.0.7 → v1.1.0: Credit/Debit Note reconciliation)
 
 User provided real sample files (`sample_data/`, gitignored) showing two things
