@@ -142,6 +142,54 @@ _CATEGORY_COLUMNS = {
     ),
 }
 
+# Same idea as _CATEGORY_COLUMNS above, for reconcile.run_note_reconciliation()'s
+# category DataFrames. Kept as a separate dict (not merged into _CATEGORY_COLUMNS)
+# because the category names ('matched_clean', 'value_tax_mismatches', ...) are
+# shared with the invoice side but the underlying columns differ (note_no/voucher_no
+# instead of invoice_no, GSTR/Books instead of 2A/PR, etc.) — the note results live
+# in their own dict (self._note_results) so there's no key collision at lookup time.
+_NOTE_CATEGORY_COLUMNS = {
+    "value_tax_mismatches": (
+        ["gstin_gstr", "supplier_name", "note_no", "voucher_no", "note_type", "book_note_type",
+         "note_date", "note_value", "gross_total", "diff_value", "igst_gstr", "igst_books", "diff_igst",
+         "cgst_gstr", "cgst_books", "diff_cgst", "sgst_gstr", "sgst_books", "diff_sgst"],
+        {"gstin_gstr": "GSTIN", "supplier_name": "Supplier Name", "note_no": "Note No (GSTR)",
+         "voucher_no": "Voucher No (Books)", "note_type": "Note Type (GSTR)", "book_note_type": "Note Type (Books)",
+         "note_date": "Note Date", "note_value": "Note Value (GSTR)", "gross_total": "Gross Total (Books)",
+         "diff_value": "Diff Value", "igst_gstr": "IGST (GSTR)", "igst_books": "IGST (Books)",
+         "diff_igst": "Diff IGST", "cgst_gstr": "CGST (GSTR)", "cgst_books": "CGST (Books)",
+         "diff_cgst": "Diff CGST", "sgst_gstr": "SGST (GSTR)", "sgst_books": "SGST (Books)", "diff_sgst": "Diff SGST"},
+    ),
+    "probable_matches": (
+        ["gstin_gstr", "supplier_name", "note_no", "voucher_no", "note_type", "book_note_type",
+         "note_date", "note_value", "gross_total"],
+        {"gstin_gstr": "GSTIN", "supplier_name": "Supplier Name", "note_no": "Note No (GSTR)",
+         "voucher_no": "Voucher No (Books)", "note_type": "Note Type (GSTR)", "book_note_type": "Note Type (Books)",
+         "note_date": "Note Date", "note_value": "Note Value (GSTR)", "gross_total": "Gross Total (Books)"},
+    ),
+    "only_in_gstr2b_cdnr": (
+        ["gstin_gstr", "supplier_name", "note_no", "note_type", "note_date", "note_value",
+         "taxable_value", "igst_gstr", "cgst_gstr", "sgst_gstr", "itc_available", "period"],
+        {"gstin_gstr": "GSTIN", "supplier_name": "Supplier Name", "note_no": "Note No",
+         "note_type": "Note Type", "note_date": "Note Date", "note_value": "Note Value",
+         "taxable_value": "Taxable Value", "igst_gstr": "IGST", "cgst_gstr": "CGST", "sgst_gstr": "SGST",
+         "itc_available": "ITC Available"},
+    ),
+    "only_in_note_register": (
+        ["gstin_books", "particulars", "voucher_no", "book_note_type", "voucher_date",
+         "gross_total", "igst_books", "cgst_books", "sgst_books"],
+        {"gstin_books": "GSTIN", "particulars": "Supplier Name", "voucher_no": "Voucher No",
+         "book_note_type": "Note Type (Books)", "voucher_date": "Voucher Date", "gross_total": "Gross Total",
+         "igst_books": "IGST", "cgst_books": "CGST", "sgst_books": "SGST"},
+    ),
+    "matched_clean": (
+        ["gstin_gstr", "supplier_name", "note_no", "note_type", "note_date", "note_value", "itc_available"],
+        {"gstin_gstr": "GSTIN", "supplier_name": "Supplier Name", "note_no": "Note No",
+         "note_type": "Note Type", "note_date": "Note Date", "note_value": "Note Value",
+         "itc_available": "ITC Available"},
+    ),
+}
+
 
 def _enable_dpi_awareness():
     """Without this, Windows bitmap-stretches the whole window on scaled displays,
@@ -456,25 +504,31 @@ class LoginScreen(tk.Tk):
 
 
 class ConflictResolutionDialog(tk.Toplevel):
-    """Shows every Purchase Register row awaiting an Overwrite/Ignore decision,
-    stored value vs newly-uploaded value side by side, per HANDOFF's 'one real
-    GUI gap'. Wired to db.list_pending_conflicts() / db.resolve_conflict()."""
+    """Shows every Purchase Register (or Credit/Debit Note Register, via entity=
+    'note') row awaiting an Overwrite/Ignore decision, stored value vs
+    newly-uploaded value side by side, per HANDOFF's 'one real GUI gap'. Wired to
+    db.list_pending_conflicts()/db.resolve_conflict() for entity='purchase', or
+    the identical note_ variants for entity='note' -- the two entities use the
+    same conflict-detection rules, so one dialog class serves both."""
 
-    def __init__(self, parent, client_id, on_close=None):
+    def __init__(self, parent, client_id, on_close=None, entity="purchase"):
         super().__init__(parent)
         self.client_id = client_id
         self.on_close = on_close
-        self.title("Pending Purchase Register Conflicts")
+        self.entity = entity
+        doc_word = "invoice" if entity == "purchase" else "credit/debit note"
+        ref_field = "Invoice No" if entity == "purchase" else "Voucher No"
+        self.title(f"Pending {'Purchase Register' if entity == 'purchase' else 'Credit/Debit Note Register'} Conflicts")
         self.geometry("1040x480")
         self.transient(parent)
         set_app_icon(self)
 
-        ttk.Label(self, text="These invoices were re-uploaded with a DIFFERENT amount than what's "
+        ttk.Label(self, text=f"These {doc_word}s were re-uploaded with a DIFFERENT amount than what's "
                              "already stored. They are excluded from reconciliation until you resolve "
                              "each one — Overwrite uses the new upload, Ignore keeps the stored value.",
                   style="Muted.TLabel", wraplength=1000, justify="left", padding=10).pack(anchor="w")
 
-        cols = ("Invoice No", "GSTIN", "Stored Gross", "New Gross", "Stored CGST", "New CGST",
+        cols = (ref_field, "GSTIN", "Stored Gross", "New Gross", "Stored CGST", "New CGST",
                 "Stored SGST", "New SGST", "Stored IGST", "New IGST")
         tree_container, self.tree = _make_scrollable_tree(self, cols, height=14)
         tree_container.pack(fill="both", expand=True, padx=10)
@@ -495,11 +549,13 @@ class ConflictResolutionDialog(tk.Toplevel):
 
     def _refresh(self):
         self.tree.delete(*self.tree.get_children())
-        self._rows = db.list_pending_conflicts(self.client_id)
+        ref_key = "invoice_no" if self.entity == "purchase" else "voucher_no"
+        list_fn = db.list_pending_conflicts if self.entity == "purchase" else db.list_pending_note_conflicts
+        self._rows = list_fn(self.client_id)
         for item in self._rows:
             p, s = item["pending"], item["stored"]
             self.tree.insert("", "end", iid=str(p["id"]), values=(
-                p["invoice_no"], p["gstin"],
+                p[ref_key], p["gstin"],
                 s["gross_total"] if s else "n/a", p["gross_total"],
                 s["cgst"] if s else "n/a", p["cgst"],
                 s["sgst"] if s else "n/a", p["sgst"],
@@ -514,8 +570,9 @@ class ConflictResolutionDialog(tk.Toplevel):
         if not sel:
             messagebox.showwarning("Nothing selected", "Select one or more rows first.", parent=self)
             return
+        resolve_fn = db.resolve_conflict if self.entity == "purchase" else db.resolve_note_conflict
         for iid in sel:
-            db.resolve_conflict(int(iid), action)
+            resolve_fn(int(iid), action)
         self._refresh()
 
     def _resolve_all(self, action):
@@ -523,7 +580,8 @@ class ConflictResolutionDialog(tk.Toplevel):
             return
         if not messagebox.askyesno("Confirm", f"{action.capitalize()} all {len(self._rows)} pending conflicts?", parent=self):
             return
-        db.resolve_all_conflicts(self.client_id, action)
+        resolve_all_fn = db.resolve_all_conflicts if self.entity == "purchase" else db.resolve_all_note_conflicts
+        resolve_all_fn(self.client_id, action)
         self._refresh()
 
     def _close(self):
@@ -789,9 +847,12 @@ class App(tk.Tk):
         header_row.pack(fill="x", pady=(0, 8))
         self.header_var = tk.StringVar(value="Select or add a client to begin")
         ttk.Label(header_row, textvariable=self.header_var, style="Title.TLabel").pack(side="left")
-        self.conflicts_btn = ttk.Button(header_row, text="Resolve Pending Conflicts",
+        self.note_conflicts_btn = ttk.Button(header_row, text="Resolve Note Conflicts",
+                                              command=self._open_note_conflicts_dialog, state="disabled")
+        self.note_conflicts_btn.pack(side="right")
+        self.conflicts_btn = ttk.Button(header_row, text="Resolve Purchase Conflicts",
                                          command=self._open_conflicts_dialog, state="disabled")
-        self.conflicts_btn.pack(side="right")
+        self.conflicts_btn.pack(side="right", padx=(0, 8))
 
         self.notebook = ttk.Notebook(right)
         self.notebook.pack(fill="both", expand=True)
@@ -817,9 +878,10 @@ class App(tk.Tk):
         state = "normal" if enabled else "disabled"
         for i in range(1, 4):
             self.notebook.tab(i, state=state if enabled else "disabled")
-        for w in (self.upload_g2a_btn, self.upload_pr_btn):
+        for w in (self.upload_g2a_btn, self.upload_pr_btn, self.upload_cn_btn, self.upload_dn_btn):
             w.configure(state=state)
         self.conflicts_btn.configure(state=state)
+        self.note_conflicts_btn.configure(state=state)
 
     # ---------------- client list ----------------
 
@@ -897,7 +959,16 @@ class App(tk.Tk):
         if not pending:
             messagebox.showinfo("No conflicts", "There are no pending Purchase Register conflicts for this client.")
             return
-        ConflictResolutionDialog(self, self.current_client_id, on_close=self._on_conflicts_closed)
+        ConflictResolutionDialog(self, self.current_client_id, on_close=self._on_conflicts_closed, entity="purchase")
+
+    def _open_note_conflicts_dialog(self):
+        if not self.current_client_id:
+            return
+        pending = db.list_pending_note_conflicts(self.current_client_id)
+        if not pending:
+            messagebox.showinfo("No conflicts", "There are no pending Credit/Debit Note Register conflicts for this client.")
+            return
+        ConflictResolutionDialog(self, self.current_client_id, on_close=self._on_conflicts_closed, entity="note")
 
     def _on_conflicts_closed(self):
         self._refresh_history_tab()
@@ -924,13 +995,35 @@ class App(tk.Tk):
                           "are auto-tagged by month/FY. Anything already stored is automatically skipped, "
                           "so it's safe to re-upload the same file by mistake. Re-uploading the same "
                           "invoice with a DIFFERENT amount is held as a pending conflict for review "
-                          "(see the 'Resolve Pending Conflicts' button above).",
+                          "(see the 'Resolve Purchase Conflicts' button above).",
                   style="Muted.TLabel", justify="left")
         lbl2.pack(anchor="w", pady=(2, 8))
         _bind_dynamic_wraplength(lbl2, t)
         self.upload_pr_btn = ttk.Button(t, text="Select Purchase Register file(s) (.xls/.xlsx)...",
                                          command=self._upload_purchase, state="disabled")
         self.upload_pr_btn.pack(anchor="w", pady=(0, 18))
+
+        ttk.Label(t, text="Step 3 — Upload the Credit Note Register (from Tally)",
+                  style="Section.TLabel").pack(anchor="w")
+        lbl3 = ttk.Label(t, text="Same conflict-detection rules as Purchase Register: identical re-uploads "
+                          "are skipped, a re-upload of the same voucher with a DIFFERENT amount is held as "
+                          "a pending conflict (see 'Resolve Note Conflicts' button above).",
+                  style="Muted.TLabel", justify="left")
+        lbl3.pack(anchor="w", pady=(2, 8))
+        _bind_dynamic_wraplength(lbl3, t)
+        self.upload_cn_btn = ttk.Button(t, text="Select Credit Note Register file(s) (.xls/.xlsx)...",
+                                         command=lambda: self._upload_note("credit"), state="disabled")
+        self.upload_cn_btn.pack(anchor="w", pady=(0, 18))
+
+        ttk.Label(t, text="Step 4 — Upload the Debit Note Register (from Tally)",
+                  style="Section.TLabel").pack(anchor="w")
+        lbl4 = ttk.Label(t, text="Same conflict-detection rules as Purchase Register.",
+                  style="Muted.TLabel", justify="left")
+        lbl4.pack(anchor="w", pady=(2, 8))
+        _bind_dynamic_wraplength(lbl4, t)
+        self.upload_dn_btn = ttk.Button(t, text="Select Debit Note Register file(s) (.xls/.xlsx)...",
+                                         command=lambda: self._upload_note("debit"), state="disabled")
+        self.upload_dn_btn.pack(anchor="w", pady=(0, 18))
 
         ttk.Separator(t).pack(fill="x", pady=10)
         self.upload_log = tk.Text(t, height=14, wrap="word", state="disabled",
@@ -952,6 +1045,7 @@ class App(tk.Tk):
         if not paths:
             return
         total_rows = 0
+        total_notes = 0
         all_periods = []
         errors = []
         for path in paths:
@@ -961,8 +1055,14 @@ class App(tk.Tk):
                 periods = sorted(df["Period"].unique())
                 all_periods.extend(periods)
                 total_rows += len(df)
+                note_msg = ""
+                cdnr_df, _ = parsers.parse_gstr2b_cdnr(path)
+                if len(cdnr_df):
+                    db.add_gstr2b_cdnr_notes(self.current_client_id, snap_id, cdnr_df)
+                    total_notes += len(cdnr_df)
+                    note_msg = f", {len(cdnr_df)} credit/debit note rows (B2B-CDNR)"
                 self._log(self.upload_log,
-                           f"{os.path.basename(path)}: {len(df)} invoice rows, periods {periods[0]}–{periods[-1]}, "
+                           f"{os.path.basename(path)}: {len(df)} invoice rows{note_msg}, periods {periods[0]}–{periods[-1]}, "
                            f"portal generation date {gen_date or 'n/a'}. Saved as snapshot #{snap_id}.")
             except parsers.ParseError as e:
                 errors.append(f"{os.path.basename(path)}: {e}")
@@ -972,8 +1072,8 @@ class App(tk.Tk):
                 self._log(self.upload_log, f"{os.path.basename(path)}: FAILED — {e}\n{traceback.format_exc()[-800:]}")
 
         if all_periods:
-            msg = (f"{len(paths)} file(s) selected, {total_rows} invoice rows saved as new snapshots.\n\n"
-                   f"Periods covered: {min(all_periods)} to {max(all_periods)}")
+            msg = (f"{len(paths)} file(s) selected, {total_rows} invoice rows and {total_notes} credit/debit "
+                   f"note rows saved as new snapshots.\n\nPeriods covered: {min(all_periods)} to {max(all_periods)}")
         else:
             msg = "No files were successfully processed."
         if errors:
@@ -1016,13 +1116,56 @@ class App(tk.Tk):
                f"{total_skipped} rows were already in the system and skipped.\n")
         if total_conflicts:
             msg += (f"\n{total_conflicts} entries have the same invoice number as one already "
-                    f"stored but a DIFFERENT amount. Use 'Resolve Pending Conflicts' above before "
+                    f"stored but a DIFFERENT amount. Use 'Resolve Purchase Conflicts' above before "
                     f"relying on totals — these are excluded from reconciliation until resolved.")
         if errors:
             msg += "\n\nThe following file(s) failed:\n" + "\n".join(errors)
             messagebox.showwarning("Purchase Register uploaded with errors", msg)
         else:
             messagebox.showinfo("Purchase Register uploaded", msg)
+        self._refresh_history_tab()
+        self._refresh_recon_tab()
+
+    def _upload_note(self, note_type):
+        label = "Credit Note" if note_type == "credit" else "Debit Note"
+        paths = filedialog.askopenfilenames(
+            title=f"Select {label} Register file(s)",
+            filetypes=[("Excel files", "*.xls *.xlsx"), ("All files", "*.*")],
+        )
+        if not paths:
+            return
+        total_new = total_skipped = total_conflicts = 0
+        errors = []
+        for path in paths:
+            try:
+                entries = parsers.parse_note_register(path, note_type)
+                result = db.add_note_batch(self.current_client_id, note_type, os.path.basename(path), entries)
+                self._log(self.upload_log,
+                           f"{os.path.basename(path)}: {result['total_in_file']} rows read → "
+                           f"{result['new_rows']} new, {result['duplicate_rows_skipped']} already stored (skipped), "
+                           f"{result['pending_conflicts']} flagged as amount conflicts for review.")
+                total_new += result["new_rows"]
+                total_skipped += result["duplicate_rows_skipped"]
+                total_conflicts += result["pending_conflicts"]
+            except parsers.ParseError as e:
+                errors.append(f"{os.path.basename(path)}: {e}")
+                self._log(self.upload_log, f"{os.path.basename(path)}: FAILED — {e}")
+            except Exception as e:
+                errors.append(f"{os.path.basename(path)}: {e}")
+                self._log(self.upload_log, f"{os.path.basename(path)}: FAILED — {e}\n{traceback.format_exc()[-800:]}")
+
+        msg = (f"{len(paths)} file(s) selected.\n"
+               f"{total_new} new entries added.\n"
+               f"{total_skipped} rows were already in the system and skipped.\n")
+        if total_conflicts:
+            msg += (f"\n{total_conflicts} entries have the same voucher number as one already "
+                    f"stored but a DIFFERENT amount. Use 'Resolve Note Conflicts' above before "
+                    f"relying on totals — these are excluded from reconciliation until resolved.")
+        if errors:
+            msg += "\n\nThe following file(s) failed:\n" + "\n".join(errors)
+            messagebox.showwarning(f"{label} Register uploaded with errors", msg)
+        else:
+            messagebox.showinfo(f"{label} Register uploaded", msg)
         self._refresh_history_tab()
         self._refresh_recon_tab()
 
@@ -1044,9 +1187,18 @@ class App(tk.Tk):
         batch_container, self.batch_tree = _make_scrollable_tree(t, cols2, height=10)
         batch_container.pack(fill="both", expand=True, pady=(0, 8))
         batch_btns = ttk.Frame(t)
-        batch_btns.pack(fill="x")
+        batch_btns.pack(fill="x", pady=(0, 20))
         ttk.Button(batch_btns, text="Download Selected...", command=self._download_batch).pack(side="left")
         ttk.Button(batch_btns, text="Delete Selected", command=self._delete_batch).pack(side="left", padx=8)
+
+        ttk.Label(t, text="Credit/Debit Note Register Upload Batches", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
+        cols3 = ("Batch #", "Type", "Uploaded", "File", "Rows in File", "New", "Skipped (dup)", "Pending Conflicts")
+        note_batch_container, self.note_batch_tree = _make_scrollable_tree(t, cols3, height=10)
+        note_batch_container.pack(fill="both", expand=True, pady=(0, 8))
+        note_batch_btns = ttk.Frame(t)
+        note_batch_btns.pack(fill="x")
+        ttk.Button(note_batch_btns, text="Download Selected...", command=self._download_note_batch).pack(side="left")
+        ttk.Button(note_batch_btns, text="Delete Selected", command=self._delete_note_batch).pack(side="left", padx=8)
 
     def _refresh_history_tab(self):
         if not self.current_client_id:
@@ -1061,6 +1213,13 @@ class App(tk.Tk):
         for b in db.list_purchase_batches(self.current_client_id):
             self.batch_tree.insert("", "end", iid=str(b["batch_id"]), values=(
                 b["batch_id"], b["uploaded_at"], b["source_filename"], b["row_count"], b["new_rows"],
+                b["duplicate_rows_skipped"], b["conflict_rows"],
+            ))
+        self.note_batch_tree.delete(*self.note_batch_tree.get_children())
+        for b in db.list_note_batches(self.current_client_id):
+            self.note_batch_tree.insert("", "end", iid=str(b["batch_id"]), values=(
+                b["batch_id"], "Credit Note" if b["note_type"] == "credit" else "Debit Note",
+                b["uploaded_at"], b["source_filename"], b["row_count"], b["new_rows"],
                 b["duplicate_rows_skipped"], b["conflict_rows"],
             ))
 
@@ -1138,6 +1297,43 @@ class App(tk.Tk):
         self._refresh_history_tab()
         self._refresh_recon_tab()
 
+    def _download_note_batch(self):
+        sel = self.note_batch_tree.selection()
+        if not sel:
+            messagebox.showwarning("Nothing selected", "Select an upload batch first.")
+            return
+        batch_id = int(sel[0])
+        default_name = f"NoteRegister_batch_{batch_id}.xlsx"
+        path = filedialog.asksaveasfilename(
+            title="Save batch as", initialfile=default_name,
+            defaultextension=".xlsx", filetypes=[("Excel workbook", "*.xlsx")],
+        )
+        if not path:
+            return
+        try:
+            service.export_note_batch(batch_id, path)
+        except Exception as e:
+            messagebox.showerror("Download failed", f"{e}\n\n{traceback.format_exc()[-800:]}")
+            return
+        if messagebox.askyesno("Saved", f"Saved to:\n{path}\n\nOpen it now?"):
+            open_file(path)
+
+    def _delete_note_batch(self):
+        sel = self.note_batch_tree.selection()
+        if not sel:
+            messagebox.showwarning("Nothing selected", "Select an upload batch first.")
+            return
+        batch_id = int(sel[0])
+        if not messagebox.askyesno(
+            "Delete upload batch",
+            "This removes every Credit/Debit Note Register row this upload added from this client's data. "
+            "This cannot be undone (though you can re-upload the same file afterwards). Continue?",
+        ):
+            return
+        db.delete_note_batch(batch_id)
+        self._refresh_history_tab()
+        self._refresh_recon_tab()
+
     # ---------------- Reconciliation tab ----------------
 
     def _build_recon_tab(self):
@@ -1178,13 +1374,17 @@ class App(tk.Tk):
         self.recon_inner_notebook.pack(fill="both", expand=True)
         self.recon_subtab_details = ttk.Frame(self.recon_inner_notebook, padding=(0, 10))
         self.recon_subtab_insights = ttk.Frame(self.recon_inner_notebook, padding=(0, 10))
+        self.recon_subtab_notes = ttk.Frame(self.recon_inner_notebook, padding=(0, 10))
         self.recon_inner_notebook.add(self.recon_subtab_details, text="Category Details")
         self.recon_inner_notebook.add(self.recon_subtab_insights, text="Insights")
+        self.recon_inner_notebook.add(self.recon_subtab_notes, text="Credit/Debit Notes")
 
         self._build_details_subtab(self.recon_subtab_details)
         self._build_insights_subtab(self.recon_subtab_insights)
+        self._build_notes_details_subtab(self.recon_subtab_notes)
 
         self._results = None
+        self._note_results = None
 
     def _build_details_subtab(self, t):
         filt = ttk.Frame(t)
@@ -1205,6 +1405,60 @@ class App(tk.Tk):
         btns.pack(fill="x")
         ttk.Button(btns, text="Export Full Report to Excel...", command=self._export_report).pack(side="left")
 
+    def _build_notes_details_subtab(self, t):
+        info_lbl = ttk.Label(t, text="A Tally 'Credit Note' matches a supplier's GSTR 'Debit Note' filing, "
+                              "and vice versa — the two sides label the same document oppositely, "
+                              "so the GSTR and Books columns below will show opposite types on a match. "
+                              "Included automatically in 'Export Full Report to Excel...' on the "
+                              "Category Details tab (Notes_* sheets) — no separate export needed here.",
+                              style="Muted.TLabel", justify="left")
+        info_lbl.pack(anchor="w", pady=(0, 8))
+        _bind_dynamic_wraplength(info_lbl, t)
+
+        self.note_summary_var = tk.StringVar(value="Run Reconciliation above to see credit/debit note results.")
+        note_summary_lbl = ttk.Label(t, textvariable=self.note_summary_var, style="Summary.TLabel", justify="left")
+        note_summary_lbl.pack(anchor="w", pady=(0, 10))
+        _bind_dynamic_wraplength(note_summary_lbl, t)
+
+        filt = ttk.Frame(t)
+        filt.pack(fill="x", pady=(0, 8))
+        ttk.Label(filt, text="View category:").pack(side="left")
+        self.note_category_var = tk.StringVar(value="value_tax_mismatches")
+        self.note_category_combo = ttk.Combobox(filt, textvariable=self.note_category_var, state="readonly", width=45, values=[
+            "value_tax_mismatches", "probable_matches", "only_in_gstr2b_cdnr",
+            "only_in_note_register", "matched_clean",
+        ])
+        self.note_category_combo.pack(side="left", padx=8)
+        self.note_category_combo.bind("<<ComboboxSelected>>", lambda e: self._render_note_category())
+
+        note_result_container, self.note_result_tree = _make_scrollable_tree(t, (), height=16)
+        note_result_container.pack(fill="both", expand=True, pady=(0, 10))
+
+    def _render_note_category(self):
+        self.note_result_tree.delete(*self.note_result_tree.get_children())
+        self.note_result_tree["columns"] = ()
+        if not self._note_results:
+            return
+        cat = self.note_category_var.get()
+        df = self._note_results.get(cat)
+        if df is None or len(df) == 0:
+            self.note_result_tree["columns"] = ("info",)
+            self.note_result_tree.heading("info", text="Result")
+            self.note_result_tree.insert("", "end", values=("No rows in this category.",))
+            return
+        spec = _NOTE_CATEGORY_COLUMNS.get(cat)
+        if spec:
+            cols, rename = spec
+            cols = [c for c in cols if c in df.columns]
+            df = df[cols].rename(columns=rename)
+        display_cols = list(df.columns)[:17]
+        self.note_result_tree["columns"] = display_cols
+        for c in display_cols:
+            self.note_result_tree.heading(c, text=c)
+            self.note_result_tree.column(c, width=_col_width(c), anchor="w")
+        for _, row in df.head(500).iterrows():
+            self.note_result_tree.insert("", "end", values=[row[c] for c in display_cols])
+
     def _refresh_recon_tab(self):
         if not self.current_client_id:
             return
@@ -1224,9 +1478,13 @@ class App(tk.Tk):
 
         self._results = None
         self._current_fy_meta = None
+        self._note_results = None
+        self._current_note_meta = None
         self.result_tree.delete(*self.result_tree.get_children())
+        self.note_result_tree.delete(*self.note_result_tree.get_children())
         self.recon_summary_var.set("")
         self.recon_cutoff_var.set("")
+        self.note_summary_var.set("Run Reconciliation above to see credit/debit note results.")
         self._reset_analysis_tab()
 
     def _run_reconciliation(self):
@@ -1241,6 +1499,33 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Reconciliation failed", f"{e}\n\n{traceback.format_exc()[-800:]}")
             return
+
+        try:
+            note_outcome = service.run_fy_note_reconciliation(self.current_client_id, self.fy_var.get())
+        except Exception as e:
+            note_outcome = None
+            self._note_results = None
+            self.note_result_tree.delete(*self.note_result_tree.get_children())
+            self.note_summary_var.set(f"Credit/debit note reconciliation failed: {e}")
+
+        if note_outcome is not None:
+            self._note_results = note_outcome["results"]
+            self._current_note_meta = note_outcome["meta"]
+            if self._current_note_meta.get("has_data"):
+                nr = self._note_results
+                self.note_summary_var.set(
+                    f"FY {self._current_note_meta['fy_label']}  |  Matched clean: {len(nr['matched_clean'])}   |   "
+                    f"Mismatches: {len(nr['value_tax_mismatches'])}   |   Probable matches: {len(nr['probable_matches'])}   |   "
+                    f"Only in GSTR-2B B2B-CDNR: {len(nr['only_in_gstr2b_cdnr'])}   |   "
+                    f"Only in Note Register: {len(nr['only_in_note_register'])}   |   "
+                    f"Pending conflicts (excluded): {self._current_note_meta['pending_conflicts_count']}"
+                )
+            else:
+                self.note_summary_var.set(
+                    f"No credit/debit note data uploaded for FY {self._current_note_meta['fy_label']} "
+                    f"(period window {self._current_note_meta['period_window_display']})."
+                )
+            self._render_note_category()
 
         self._results = outcome["results"]
         self._current_fy_meta = outcome["meta"]

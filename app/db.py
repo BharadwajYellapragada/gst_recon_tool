@@ -118,6 +118,71 @@ CREATE INDEX IF NOT EXISTS idx_pr_fy ON purchase_entries(client_id, entry_fy);
 CREATE INDEX IF NOT EXISTS idx_pr_month ON purchase_entries(client_id, entry_month);
 CREATE INDEX IF NOT EXISTS idx_pr_status ON purchase_entries(client_id, status);
 
+CREATE TABLE IF NOT EXISTS gstr2b_cdnr_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id INTEGER NOT NULL,
+    client_id INTEGER NOT NULL,
+    period TEXT,
+    gstin TEXT,
+    supplier_name TEXT,
+    note_no TEXT,
+    note_type TEXT,
+    note_date TEXT,
+    note_value REAL,
+    taxable_value REAL,
+    igst REAL,
+    cgst REAL,
+    sgst REAL,
+    cess REAL,
+    filing_date TEXT,
+    itc_available TEXT,
+    reason TEXT,
+    match_key TEXT,
+    FOREIGN KEY(snapshot_id) REFERENCES gstr2a_snapshots(snapshot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cdnr_matchkey ON gstr2b_cdnr_notes(snapshot_id, match_key);
+
+CREATE TABLE IF NOT EXISTS note_batches (
+    batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_id INTEGER NOT NULL,
+    note_type TEXT NOT NULL,
+    uploaded_at TEXT NOT NULL,
+    source_filename TEXT,
+    row_count INTEGER,
+    new_rows INTEGER,
+    duplicate_rows_skipped INTEGER,
+    conflict_rows INTEGER,
+    FOREIGN KEY(client_id) REFERENCES clients(client_id)
+);
+
+CREATE TABLE IF NOT EXISTS note_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_id INTEGER NOT NULL,
+    batch_id INTEGER NOT NULL,
+    note_type TEXT NOT NULL,
+    entry_date TEXT,
+    entry_fy TEXT,
+    entry_month TEXT,
+    particulars TEXT,
+    voucher_no TEXT,
+    voucher_date TEXT,
+    gstin TEXT,
+    gross_total REAL,
+    cgst REAL,
+    sgst REAL,
+    igst REAL,
+    match_key TEXT,
+    row_hash TEXT UNIQUE,
+    is_conflict INTEGER DEFAULT 0,
+    conflict_note TEXT,
+    status TEXT DEFAULT 'active',
+    FOREIGN KEY(client_id) REFERENCES clients(client_id),
+    FOREIGN KEY(batch_id) REFERENCES note_batches(batch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_note_matchkey ON note_entries(client_id, match_key, note_type);
+CREATE INDEX IF NOT EXISTS idx_note_fy ON note_entries(client_id, entry_fy);
+CREATE INDEX IF NOT EXISTS idx_note_status ON note_entries(client_id, status);
+
 CREATE TABLE IF NOT EXISTS recon_runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
     client_id INTEGER NOT NULL,
@@ -193,6 +258,11 @@ def unlock_or_init(password):
                 token = f.read()
             raw = security.decrypt_bytes(key, token)
             conn.deserialize(raw)
+            # Re-run the schema (all statements are CREATE ... IF NOT EXISTS) so
+            # tables added by a newer app version get created on an older,
+            # already-encrypted database without disturbing existing data.
+            conn.executescript(SCHEMA)
+            conn.commit()
         else:
             conn.executescript(SCHEMA)
             conn.commit()
@@ -279,8 +349,11 @@ def get_client(client_id):
 def delete_client(client_id):
     conn = get_conn()
     conn.execute("DELETE FROM recon_runs WHERE client_id=?", (client_id,))
+    conn.execute("DELETE FROM note_entries WHERE client_id=?", (client_id,))
+    conn.execute("DELETE FROM note_batches WHERE client_id=?", (client_id,))
     conn.execute("DELETE FROM purchase_entries WHERE client_id=?", (client_id,))
     conn.execute("DELETE FROM purchase_batches WHERE client_id=?", (client_id,))
+    conn.execute("DELETE FROM gstr2b_cdnr_notes WHERE client_id=?", (client_id,))
     conn.execute("DELETE FROM gstr2a_invoices WHERE client_id=?", (client_id,))
     conn.execute("DELETE FROM gstr2a_snapshots WHERE client_id=?", (client_id,))
     conn.execute("DELETE FROM clients WHERE client_id=?", (client_id,))
@@ -366,6 +439,63 @@ def get_merged_gstr2a_invoices(client_id, period_window):
         return df.drop(columns=["snap_uploaded_at"], errors="ignore")
 
     latest = df.groupby(["match_key", "rate"])["snap_uploaded_at"].transform("max")
+    df = df[df["snap_uploaded_at"] == latest]
+    return df.drop(columns=["snap_uploaded_at"])
+
+
+# ---------------- GSTR-2B credit/debit note (B2B-CDNR) operations ----------------
+
+def add_gstr2b_cdnr_notes(client_id, snapshot_id, notes_df):
+    """Stores the B2B-CDNR rows parsed alongside a GSTR-2A/2B upload, tied to the
+    same snapshot_id as the B2B invoices from that same file (one upload, one
+    snapshot, two child row sets). No-op if notes_df is empty."""
+    if len(notes_df) == 0:
+        return
+    conn = get_conn()
+    records = [
+        (snapshot_id, client_id, r.Period, r.GSTIN, r.SupplierName, r.NoteNo, r.NoteType,
+         r.NoteDate, r.NoteValue, r.TaxableValue, r.IGST, r.CGST, r.SGST, r.Cess,
+         r.FilingDate, r.ITCAvailable, r.Reason, r.MatchKey)
+        for r in notes_df.itertuples()
+    ]
+    conn.executemany(
+        """INSERT INTO gstr2b_cdnr_notes
+           (snapshot_id, client_id, period, gstin, supplier_name, note_no, note_type,
+            note_date, note_value, taxable_value, igst, cgst, sgst, cess,
+            filing_date, itc_available, reason, match_key)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        records,
+    )
+    conn.commit()
+    persist()
+
+
+def get_cdnr_notes_for_snapshot(snapshot_id):
+    import pandas as pd
+    return pd.read_sql_query(
+        "SELECT * FROM gstr2b_cdnr_notes WHERE snapshot_id=?", get_conn(), params=(snapshot_id,)
+    )
+
+
+def get_merged_gstr2b_cdnr_notes(client_id, period_window):
+    """Same cumulative-download de-duplication as get_merged_gstr2a_invoices, applied
+    to credit/debit notes: for each (match_key, note_type), only the row from the
+    most-recently-uploaded snapshot is kept."""
+    import pandas as pd
+    df = pd.read_sql_query(
+        """SELECT cn.*, gs.uploaded_at AS snap_uploaded_at
+           FROM gstr2b_cdnr_notes cn
+           JOIN gstr2a_snapshots gs ON gs.snapshot_id = cn.snapshot_id
+           WHERE cn.client_id=?""",
+        get_conn(), params=(client_id,),
+    )
+    if len(df) == 0:
+        return df.drop(columns=["snap_uploaded_at"], errors="ignore")
+    df = df[df["period"].isin(period_window)].copy()
+    if len(df) == 0:
+        return df.drop(columns=["snap_uploaded_at"], errors="ignore")
+
+    latest = df.groupby(["match_key", "note_type"])["snap_uploaded_at"].transform("max")
     df = df[df["snap_uploaded_at"] == latest]
     return df.drop(columns=["snap_uploaded_at"])
 
@@ -542,6 +672,7 @@ def delete_purchase_batch(batch_id):
 def delete_gstr2a_snapshot(snapshot_id):
     conn = get_conn()
     conn.execute("DELETE FROM gstr2a_invoices WHERE snapshot_id=?", (snapshot_id,))
+    conn.execute("DELETE FROM gstr2b_cdnr_notes WHERE snapshot_id=?", (snapshot_id,))
     conn.execute("DELETE FROM gstr2a_snapshots WHERE snapshot_id=?", (snapshot_id,))
     conn.commit()
     persist()
@@ -582,6 +713,198 @@ def get_purchase_entries_by_month(client_id, year_month):
     return pd.read_sql_query(
         "SELECT * FROM purchase_entries WHERE client_id=? AND entry_month=? AND status='active'",
         get_conn(), params=(client_id, year_month)
+    )
+
+
+# ---------------- Credit/Debit Note Register operations ----------------
+# Mirrors the Purchase Register operations above (same conflict-detection rules:
+# an identical re-upload is silently skipped; a re-upload of the same voucher with
+# a different amount becomes a pending_conflict awaiting Overwrite/Ignore) — kept
+# as separate functions rather than parameterizing the purchase-entry ones so each
+# stays simple, at the cost of some duplication.
+
+def note_row_hash(client_id, note_type, match_key, voucher_date, gross_total, cgst, sgst, igst):
+    s = f"{client_id}|{note_type}|{match_key}|{voucher_date}|{gross_total:.2f}|{cgst:.2f}|{sgst:.2f}|{igst:.2f}"
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def add_note_batch(client_id, note_type, source_filename, entries):
+    """
+    entries: list of dicts with keys note_type, entry_date, entry_fy, entry_month,
+             particulars, voucher_no, voucher_date, gstin, gross_total, cgst, sgst,
+             igst, match_key (as produced by parsers.parse_note_register).
+
+    Conflict handling identical to add_purchase_batch, scoped to (client_id,
+    note_type, match_key) so a Credit Note and a Debit Note that happen to share
+    a voucher number for the same GSTIN are never treated as colliding.
+
+    Returns dict with counts: new_rows, duplicate_rows_skipped, pending_conflicts.
+    """
+    conn = get_conn()
+    cur = conn.execute(
+        """INSERT INTO note_batches
+           (client_id, note_type, uploaded_at, source_filename, row_count, new_rows, duplicate_rows_skipped, conflict_rows)
+           VALUES (?, ?, ?, ?, ?, 0, 0, 0)""",
+        (client_id, note_type, now(), source_filename, len(entries)),
+    )
+    batch_id = cur.lastrowid
+
+    new_rows = 0
+    dup_rows = 0
+    pending_conflicts = 0
+
+    existing = conn.execute(
+        "SELECT match_key, voucher_date, gross_total, cgst, sgst, igst FROM note_entries "
+        "WHERE client_id=? AND note_type=? AND status='active'",
+        (client_id, note_type),
+    ).fetchall()
+    existing_by_key = {}
+    for e in existing:
+        existing_by_key.setdefault(e["match_key"], []).append(e)
+
+    for e in entries:
+        rh = note_row_hash(client_id, note_type, e["match_key"], e["voucher_date"], e["gross_total"], e["cgst"], e["sgst"], e["igst"])
+        already = conn.execute("SELECT 1 FROM note_entries WHERE row_hash=?", (rh,)).fetchone()
+        if already:
+            dup_rows += 1
+            continue
+
+        prior = existing_by_key.get(e["match_key"], [])
+        is_conflict = 1 if prior else 0
+        status = "pending_conflict" if prior else "active"
+        conflict_note = None
+        if prior:
+            p = prior[0]
+            conflict_note = (
+                f"Same voucher already stored with different amount: "
+                f"Gross {p['gross_total']:.2f} (stored) vs {e['gross_total']:.2f} (this upload)"
+            )
+            pending_conflicts += 1
+
+        conn.execute(
+            """INSERT INTO note_entries
+               (client_id, batch_id, note_type, entry_date, entry_fy, entry_month, particulars, voucher_no,
+                voucher_date, gstin, gross_total, cgst, sgst, igst, match_key, row_hash,
+                is_conflict, conflict_note, status)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (client_id, batch_id, note_type, e["entry_date"], e.get("entry_fy", ""), e.get("entry_month", ""),
+             e["particulars"], e["voucher_no"], e["voucher_date"], e["gstin"], e["gross_total"],
+             e["cgst"], e["sgst"], e["igst"], e["match_key"], rh, is_conflict, conflict_note, status),
+        )
+        if status == "active":
+            new_rows += 1
+            existing_by_key.setdefault(e["match_key"], []).append(
+                {"match_key": e["match_key"], "voucher_date": e["voucher_date"],
+                 "gross_total": e["gross_total"], "cgst": e["cgst"], "sgst": e["sgst"], "igst": e["igst"]}
+            )
+
+    conn.execute(
+        "UPDATE note_batches SET new_rows=?, duplicate_rows_skipped=?, conflict_rows=? WHERE batch_id=?",
+        (new_rows, dup_rows, pending_conflicts, batch_id),
+    )
+    conn.commit()
+    persist()
+    return {"batch_id": batch_id, "new_rows": new_rows, "duplicate_rows_skipped": dup_rows,
+            "pending_conflicts": pending_conflicts, "total_in_file": len(entries)}
+
+
+def list_pending_note_conflicts(client_id, note_type=None):
+    conn = get_conn()
+    if note_type:
+        pending = conn.execute(
+            "SELECT * FROM note_entries WHERE client_id=? AND note_type=? AND status='pending_conflict' ORDER BY id",
+            (client_id, note_type),
+        ).fetchall()
+    else:
+        pending = conn.execute(
+            "SELECT * FROM note_entries WHERE client_id=? AND status='pending_conflict' ORDER BY id",
+            (client_id,),
+        ).fetchall()
+    result = []
+    for p in pending:
+        active = conn.execute(
+            "SELECT * FROM note_entries WHERE client_id=? AND note_type=? AND match_key=? AND status='active'",
+            (client_id, p["note_type"], p["match_key"]),
+        ).fetchone()
+        result.append({"pending": dict(p), "stored": dict(active) if active else None})
+    return result
+
+
+def resolve_note_conflict(pending_entry_id, action):
+    if action not in ("overwrite", "ignore"):
+        raise ValueError("action must be 'overwrite' or 'ignore'")
+    conn = get_conn()
+    pending = conn.execute(
+        "SELECT * FROM note_entries WHERE id=? AND status='pending_conflict'", (pending_entry_id,)
+    ).fetchone()
+    if pending is None:
+        raise ValueError(f"No pending conflict found with id={pending_entry_id}")
+
+    if action == "ignore":
+        conn.execute("UPDATE note_entries SET status='ignored' WHERE id=?", (pending_entry_id,))
+    else:  # overwrite
+        conn.execute(
+            "UPDATE note_entries SET status='superseded' WHERE client_id=? AND note_type=? AND match_key=? AND status='active'",
+            (pending["client_id"], pending["note_type"], pending["match_key"]),
+        )
+        conn.execute("UPDATE note_entries SET status='active' WHERE id=?", (pending_entry_id,))
+    conn.commit()
+    persist()
+
+
+def resolve_all_note_conflicts(client_id, action, note_type=None):
+    for item in list_pending_note_conflicts(client_id, note_type):
+        resolve_note_conflict(item["pending"]["id"], action)
+
+
+def list_note_batches(client_id, note_type=None):
+    if note_type:
+        return get_conn().execute(
+            "SELECT * FROM note_batches WHERE client_id=? AND note_type=? ORDER BY uploaded_at DESC",
+            (client_id, note_type),
+        ).fetchall()
+    return get_conn().execute(
+        "SELECT * FROM note_batches WHERE client_id=? ORDER BY uploaded_at DESC", (client_id,)
+    ).fetchall()
+
+
+def get_all_note_entries(client_id, note_type=None):
+    import pandas as pd
+    if note_type:
+        return pd.read_sql_query(
+            "SELECT * FROM note_entries WHERE client_id=? AND note_type=? AND status='active'",
+            get_conn(), params=(client_id, note_type)
+        )
+    return pd.read_sql_query(
+        "SELECT * FROM note_entries WHERE client_id=? AND status='active'", get_conn(), params=(client_id,)
+    )
+
+
+def get_note_entries_by_batch(batch_id):
+    import pandas as pd
+    return pd.read_sql_query(
+        "SELECT * FROM note_entries WHERE batch_id=?", get_conn(), params=(batch_id,)
+    )
+
+
+def delete_note_batch(batch_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM note_entries WHERE batch_id=?", (batch_id,))
+    conn.execute("DELETE FROM note_batches WHERE batch_id=?", (batch_id,))
+    conn.commit()
+    persist()
+
+
+def get_note_entries_by_fy(client_id, fy_label, note_type=None):
+    import pandas as pd
+    if note_type:
+        return pd.read_sql_query(
+            "SELECT * FROM note_entries WHERE client_id=? AND entry_fy=? AND note_type=? AND status='active'",
+            get_conn(), params=(client_id, fy_label, note_type)
+        )
+    return pd.read_sql_query(
+        "SELECT * FROM note_entries WHERE client_id=? AND entry_fy=? AND status='active'",
+        get_conn(), params=(client_id, fy_label)
     )
 
 

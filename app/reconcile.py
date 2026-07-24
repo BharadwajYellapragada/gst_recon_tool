@@ -1,8 +1,9 @@
 """
 Reconciliation engine: matches GSTR-2A snapshot invoices against stored
-Purchase Register entries for a client.
+Purchase Register entries for a client, and separately matches GSTR-2B
+credit/debit notes against stored Credit/Debit Note Register entries.
 
-Categories produced:
+Invoice categories produced:
   - matched_clean        : ties out within tolerance
   - value_tax_mismatches  : matched by GSTIN+invoice, but amounts differ
   - probable_matches      : GSTIN+date+amount agree but invoice numbers differ
@@ -10,8 +11,16 @@ Categories produced:
   - only_in_purchase_register : truly unmatched, present only in books
   - pr_duplicates          : flagged conflict rows already recorded during import
   - multi_rate_reference   : legitimate multi-rate line splits within GSTR-2A (not an error)
+
+Note categories produced by run_note_reconciliation (see its docstring for the
+Tally<->GSTR type-flip this applies before matching):
+  - matched_clean, value_tax_mismatches, probable_matches : same meaning as above
+  - only_in_gstr2b_cdnr    : truly unmatched, present only in the GSTR-2B B2B-CDNR sheet
+  - only_in_note_register  : truly unmatched, present only in the Tally CN/DN register
 """
 import pandas as pd
+
+from . import parsers
 
 TOLERANCE = 2.0
 
@@ -145,6 +154,129 @@ def _fuzzy_fallback(left_only, right_only):
     })
     fuzzy_right = right_only[right_only["fuzzy_key"].isin(common)][
         ["fuzzy_key", "gstin_pr", "particulars", "invoice_no_pr", "invoice_date_pr", "gross_total"]
+    ]
+    probable = pd.merge(fuzzy_left, fuzzy_right, on="fuzzy_key")
+
+    true_left = left_only[~left_only["fuzzy_key"].isin(common)]
+    true_right = right_only[~right_only["fuzzy_key"].isin(common)]
+    return probable, true_left, true_right
+
+
+# ---------------- Credit/Debit Note reconciliation ----------------
+
+def _agg_cdnr(df):
+    return df.groupby("type_key").agg(
+        gstin=("gstin", "first"),
+        supplier_name=("supplier_name", "first"),
+        note_no=("note_no", "first"),
+        note_type=("note_type", "first"),
+        note_date=("note_date", "first"),
+        period=("period", lambda x: ", ".join(sorted(set(x)))),
+        note_value=("note_value", "max"),
+        taxable_value=("taxable_value", "sum"),
+        igst=("igst", "sum"),
+        cgst=("cgst", "sum"),
+        sgst=("sgst", "sum"),
+        row_count=("note_no", "count"),
+        itc_available=("itc_available", lambda x: ", ".join(sorted(set(x)))),
+    ).reset_index()
+
+
+def _agg_notes(df):
+    return df.groupby("type_key").agg(
+        gstin=("gstin", "first"),
+        particulars=("particulars", "first"),
+        voucher_no=("voucher_no", "first"),
+        voucher_date=("voucher_date", "first"),
+        book_note_type=("note_type", "first"),
+        gstr_equiv_type=("gstr_equiv_type", "first"),
+        gross_total=("gross_total", "sum"),
+        igst=("igst", "sum"),
+        cgst=("cgst", "sum"),
+        sgst=("sgst", "sum"),
+        row_count=("voucher_no", "count"),
+    ).reset_index()
+
+
+def run_note_reconciliation(cdnr_df, notes_df):
+    """
+    cdnr_df:  DataFrame from db.get_merged_gstr2b_cdnr_notes() -- GSTR-2B B2B-CDNR rows.
+              note_type here is the SUPPLIER's own filing classification: 'Credit
+              Note' or 'Debit Note'.
+    notes_df: DataFrame from db.get_all_note_entries() / get_note_entries_by_fy() --
+              Tally Credit/Debit Note Register rows. note_type here is 'credit' or
+              'debit' -- the BUYER's own books classification.
+
+    A Tally 'credit' note is the buyer-side mirror of a supplier's GSTR 'Debit Note'
+    filing, and vice versa (see parsers.TALLY_TO_GSTR_NOTE_TYPE): when the buyer
+    returns goods, the buyer's books record it as a Credit Note (crediting the
+    supplier's account back), while the supplier's GSTR-1 filing records the same
+    event as a Debit Note reducing the buyer's ITC... the two sides use opposite
+    labels for the identical transaction. So matching flips the Tally side's type
+    to its GSTR equivalent before comparing, instead of comparing types directly.
+
+    Returns a dict of DataFrames: matched_clean, value_tax_mismatches,
+    probable_matches, only_in_gstr2b_cdnr, only_in_note_register.
+    """
+    cdnr_df = cdnr_df.copy()
+    notes_df = notes_df.copy()
+    cdnr_df["type_key"] = cdnr_df["match_key"] + "|" + cdnr_df["note_type"]
+    notes_df["gstr_equiv_type"] = notes_df["note_type"].map(parsers.TALLY_TO_GSTR_NOTE_TYPE)
+    notes_df["type_key"] = notes_df["match_key"] + "|" + notes_df["gstr_equiv_type"]
+
+    cdnr_agg = _agg_cdnr(cdnr_df)
+    notes_agg = _agg_notes(notes_df)
+
+    merged = pd.merge(cdnr_agg, notes_agg, on="type_key", how="outer", indicator=True,
+                       suffixes=("_gstr", "_books"))
+
+    both = merged[merged["_merge"] == "both"].copy()
+    left_only = merged[merged["_merge"] == "left_only"].copy()
+    right_only = merged[merged["_merge"] == "right_only"].copy()
+
+    both["diff_value"] = (both["note_value"] - both["gross_total"]).round(2)
+    both["diff_igst"] = (both["igst_gstr"] - both["igst_books"]).round(2)
+    both["diff_cgst"] = (both["cgst_gstr"] - both["cgst_books"]).round(2)
+    both["diff_sgst"] = (both["sgst_gstr"] - both["sgst_books"]).round(2)
+    both["mismatch"] = (
+        (both["diff_value"].abs() > TOLERANCE) | (both["diff_igst"].abs() > TOLERANCE) |
+        (both["diff_cgst"].abs() > TOLERANCE) | (both["diff_sgst"].abs() > TOLERANCE)
+    )
+    matched_clean = both[~both["mismatch"]].copy()
+    value_tax_mismatches = both[both["mismatch"]].copy()
+
+    probable_matches, true_left, true_right = _fuzzy_note_fallback(left_only, right_only)
+
+    return {
+        "matched_clean": matched_clean,
+        "value_tax_mismatches": value_tax_mismatches,
+        "probable_matches": probable_matches,
+        "only_in_gstr2b_cdnr": true_left,
+        "only_in_note_register": true_right,
+    }
+
+
+def _fuzzy_note_fallback(left_only, right_only):
+    left_only = left_only.copy()
+    right_only = right_only.copy()
+    left_only["fuzzy_key"] = (
+        left_only["gstin_gstr"].astype(str) + "|" + left_only["note_date"].astype(str)
+        + "|" + left_only["note_value"].round(0).astype(str) + "|" + left_only["note_type"].astype(str)
+    )
+    right_only["fuzzy_key"] = (
+        right_only["gstin_books"].astype(str) + "|" + right_only["voucher_date"].astype(str)
+        + "|" + right_only["gross_total"].round(0).astype(str) + "|" + right_only["gstr_equiv_type"].astype(str)
+    )
+
+    l_counts = left_only["fuzzy_key"].value_counts()
+    r_counts = right_only["fuzzy_key"].value_counts()
+    common = set(l_counts[l_counts == 1].index) & set(r_counts[r_counts == 1].index)
+
+    fuzzy_left = left_only[left_only["fuzzy_key"].isin(common)][
+        ["fuzzy_key", "gstin_gstr", "supplier_name", "note_no", "note_date", "note_value", "note_type"]
+    ]
+    fuzzy_right = right_only[right_only["fuzzy_key"].isin(common)][
+        ["fuzzy_key", "gstin_books", "particulars", "voucher_no", "voucher_date", "gross_total", "book_note_type"]
     ]
     probable = pd.merge(fuzzy_left, fuzzy_right, on="fuzzy_key")
 

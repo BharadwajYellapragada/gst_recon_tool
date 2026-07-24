@@ -53,7 +53,8 @@ def _write_df(ws, df, start_row=1, money_cols=None):
     return start_row + len(df)
 
 
-def build_report(client_name, client_gstin, snapshot_info, purchase_asof, results, output_path, fy_meta=None):
+def build_report(client_name, client_gstin, snapshot_info, purchase_asof, results, output_path, fy_meta=None,
+                  note_results=None, note_meta=None):
     """
     client_name, client_gstin: str
     snapshot_info: dict with keys uploaded_at, generation_date, period_min, period_max, row_count
@@ -62,6 +63,11 @@ def build_report(client_name, client_gstin, snapshot_info, purchase_asof, result
     output_path: full path to save the .xlsx
     fy_meta: optional dict from service.run_fy_reconciliation()'s 'meta' — if given, the
              Summary sheet is scoped to that financial year and its late-filing window.
+    note_results: optional dict of DataFrames from reconcile.run_note_reconciliation()
+                  (via service.run_fy_note_reconciliation()) — if given (and
+                  note_meta['has_data'] is True), adds a Credit/Debit Note section to
+                  the Summary sheet plus dedicated Notes_* sheets.
+    note_meta: optional dict from service.run_fy_note_reconciliation()'s 'meta'.
     """
     wb = Workbook()
 
@@ -138,6 +144,53 @@ def build_report(client_name, client_gstin, snapshot_info, purchase_asof, result
             cell.border = BORDER
     for col, w in zip("BCDE", [65, 10, 20, 28]):
         ws.column_dimensions[col].width = w
+
+    r_next = r0 + len(recon_rows) + 1
+    if note_meta and note_meta.get("has_data") and note_results is not None:
+        n_matched = note_results["matched_clean"]
+        n_mismatches = note_results["value_tax_mismatches"]
+        n_probable = note_results["probable_matches"]
+        n_only_gstr = note_results["only_in_gstr2b_cdnr"]
+        n_only_books = note_results["only_in_note_register"]
+
+        ws[f"B{r_next}"] = "Credit / Debit Note Reconciliation"
+        ws[f"B{r_next}"].font = Font(name=FONT, bold=True, size=12, color='1F4E78')
+        ws[f"B{r_next + 1}"] = (
+            "A Tally 'Credit Note' register entry matches a supplier's GSTR-2B 'Debit Note' filing, "
+            "and vice versa — the two sides label the same document oppositely (see the GSTR/Books "
+            "columns on each Notes_* sheet)."
+        )
+        ws[f"B{r_next + 1}"].font = SUB_FONT
+        note_rows = [
+            ("Category", "Count", "Value Impact (Rs)", "Sheet"),
+            ("Matched & fully agree (within Rs 2 tolerance)", len(n_matched), "", "Notes_Matched_Clean"),
+            ("Matched but value/tax mismatch", len(n_mismatches),
+             round(n_mismatches["diff_value"].abs().sum(), 2) if len(n_mismatches) else 0, "Notes_Value_Tax_Mismatches"),
+            ("Probable match — note no. differs, GSTIN+date+amount agree", len(n_probable), "", "Notes_Probable_Matches"),
+            ("In GSTR-2B B2B-CDNR only — not found in books", len(n_only_gstr),
+             round(n_only_gstr["note_value"].sum(), 2) if len(n_only_gstr) else 0, "Notes_Only_In_GSTR2B_CDNR"),
+            ("In Note Register only — supplier hasn't filed", len(n_only_books),
+             round(n_only_books["gross_total"].sum(), 2) if len(n_only_books) else 0, "Notes_Only_In_NoteRegister"),
+        ]
+        nr0 = r_next + 3
+        for i, rrow in enumerate(note_rows):
+            for j, val in enumerate(rrow):
+                cell = ws.cell(row=nr0 + i, column=2 + j, value=val)
+                if i == 0:
+                    cell.fill = HEADER_FILL
+                    cell.font = HEADER_FONT
+                else:
+                    cell.font = NORMAL
+                    if isinstance(val, float):
+                        cell.number_format = "#,##0.00"
+                cell.border = BORDER
+        note_pending = note_results.get("pending_conflicts")
+        if note_pending:
+            pr_row = nr0 + len(note_rows) + 1
+            ws[f"B{pr_row}"] = (f"⚠ {len(note_pending)} uploaded Note Register row(s) are awaiting an "
+                                 f"Overwrite/Ignore decision and are EXCLUDED from the figures above until "
+                                 f"resolved. See Notes_Pending_Conflicts sheet.")
+            ws[f"B{pr_row}"].font = Font(name=FONT, size=10, bold=True, color='9C0006')
 
     # ---------------- Value_Tax_Mismatches ----------------
     ws2 = wb.create_sheet("Value_Tax_Mismatches")
@@ -310,6 +363,151 @@ def build_report(client_name, client_gstin, snapshot_info, purchase_asof, result
              "Only_In_PurchaseRegister", "Duplicates_GSTR2A", "MultiRate_Reference", "Matched_Clean"]
     if pending:
         order.insert(1, "Pending_Conflicts")
+
+    if note_meta and note_meta.get("has_data") and note_results is not None:
+        note_order = _write_note_sheets(wb, note_results)
+        order += note_order
+
     wb._sheets = [wb[s] for s in order]
     wb.save(output_path)
     return output_path
+
+
+def _write_note_sheets(wb, note_results):
+    """Adds the Notes_* sheets (mirrors the invoice-side sheets above) for a
+    credit/debit note reconciliation. Returns the sheet names in display order."""
+    matched = note_results["matched_clean"]
+    mismatches = note_results["value_tax_mismatches"]
+    probable = note_results["probable_matches"]
+    only_gstr = note_results["only_in_gstr2b_cdnr"]
+    only_books = note_results["only_in_note_register"]
+    pending = note_results.get("pending_conflicts")
+
+    order = []
+
+    ws = wb.create_sheet("Notes_Value_Tax_Mismatches")
+    order.append("Notes_Value_Tax_Mismatches")
+    if len(mismatches):
+        cols = ["gstin_gstr", "supplier_name", "note_no", "voucher_no", "note_type", "book_note_type",
+                "note_date", "note_value", "gross_total", "diff_value", "igst_gstr", "igst_books", "diff_igst",
+                "cgst_gstr", "cgst_books", "diff_cgst", "sgst_gstr", "sgst_books", "diff_sgst"]
+        df = mismatches[cols].rename(columns={
+            "gstin_gstr": "GSTIN", "supplier_name": "Supplier Name", "note_no": "Note No (GSTR)",
+            "voucher_no": "Voucher No (Books)", "note_type": "Note Type (GSTR)", "book_note_type": "Note Type (Books)",
+            "note_date": "Note Date", "note_value": "Note Value (GSTR)", "gross_total": "Gross Total (Books)",
+            "diff_value": "Diff_Value", "igst_gstr": "IGST (GSTR)", "igst_books": "IGST (Books)",
+            "diff_igst": "Diff_IGST", "cgst_gstr": "CGST (GSTR)", "cgst_books": "CGST (Books)",
+            "diff_cgst": "Diff_CGST", "sgst_gstr": "SGST (GSTR)", "sgst_books": "SGST (Books)", "diff_sgst": "Diff_SGST",
+        }).sort_values("Diff_Value", key=abs, ascending=False)
+        money_cols = ["Note Value (GSTR)", "Gross Total (Books)", "Diff_Value", "IGST (GSTR)", "IGST (Books)",
+                      "Diff_IGST", "CGST (GSTR)", "CGST (Books)", "Diff_CGST", "SGST (GSTR)", "SGST (Books)", "Diff_SGST"]
+        lastrow = _write_df(ws, df, money_cols=money_cols)
+        diff_idx = [df.columns.get_loc(c) + 1 for c in ["Diff_Value", "Diff_IGST", "Diff_CGST", "Diff_SGST"]]
+        for r in range(2, lastrow + 1):
+            for c in diff_idx:
+                cell = ws.cell(row=r, column=c)
+                if cell.value and abs(cell.value) > 2:
+                    cell.fill = RED_FILL
+                    cell.font = RED_FONT
+    else:
+        ws["A1"] = "No value/tax mismatches found among matched credit/debit notes."
+        ws["A1"].font = BOLD
+
+    ws = wb.create_sheet("Notes_Probable_Matches")
+    order.append("Notes_Probable_Matches")
+    ws["A1"] = ("Same GSTIN, same date, same amount (matching the Tally↔GSTR note-type flip) but note "
+                "numbers differ. Likely a typo/format difference on one side — verify manually.")
+    ws["A1"].font = SUB_FONT
+    if len(probable):
+        cols = ["gstin_gstr", "supplier_name", "note_no", "voucher_no", "note_type", "book_note_type",
+                "note_date", "note_value", "gross_total"]
+        df = probable[cols].rename(columns={
+            "gstin_gstr": "GSTIN", "supplier_name": "Supplier Name", "note_no": "Note No (GSTR)",
+            "voucher_no": "Voucher No (Books)", "note_type": "Note Type (GSTR)", "book_note_type": "Note Type (Books)",
+            "note_date": "Note Date", "note_value": "Note Value (GSTR)", "gross_total": "Gross Total (Books)",
+        })
+        lastrow = _write_df(ws, df, start_row=3, money_cols=["Note Value (GSTR)", "Gross Total (Books)"])
+        for r in range(4, lastrow + 2):
+            ws.cell(row=r, column=3).fill = YELLOW_FILL
+            ws.cell(row=r, column=4).fill = YELLOW_FILL
+
+    ws = wb.create_sheet("Notes_Only_In_GSTR2B_CDNR")
+    order.append("Notes_Only_In_GSTR2B_CDNR")
+    if len(only_gstr):
+        cols = ["gstin_gstr", "supplier_name", "note_no", "note_type", "note_date", "note_value",
+                "taxable_value", "igst_gstr", "cgst_gstr", "sgst_gstr", "itc_available", "period"]
+        df = only_gstr[cols].rename(columns={
+            "gstin_gstr": "GSTIN", "supplier_name": "Supplier Name", "note_no": "Note No",
+            "note_type": "Note Type", "note_date": "Note Date", "note_value": "Note Value",
+            "taxable_value": "Taxable Value", "igst_gstr": "IGST", "cgst_gstr": "CGST", "sgst_gstr": "SGST",
+            "itc_available": "ITC Available",
+        }).sort_values("Note Value", ascending=False)
+        money_cols = ["Note Value", "Taxable Value", "IGST", "CGST", "SGST"]
+        lastrow = _write_df(ws, df, money_cols=money_cols)
+        for r in range(2, lastrow + 1):
+            ws.cell(row=r, column=1).fill = YELLOW_FILL
+    else:
+        ws["A1"] = "Nothing found only in the GSTR-2B B2B-CDNR sheet."
+        ws["A1"].font = BOLD
+
+    ws = wb.create_sheet("Notes_Only_In_NoteRegister")
+    order.append("Notes_Only_In_NoteRegister")
+    if len(only_books):
+        cols = ["gstin_books", "particulars", "voucher_no", "book_note_type", "voucher_date",
+                "gross_total", "igst_books", "cgst_books", "sgst_books"]
+        df = only_books[cols].rename(columns={
+            "gstin_books": "GSTIN", "particulars": "Supplier Name", "voucher_no": "Voucher No",
+            "book_note_type": "Note Type (Books)", "voucher_date": "Voucher Date", "gross_total": "Gross Total",
+            "igst_books": "IGST", "cgst_books": "CGST", "sgst_books": "SGST",
+        }).sort_values("Gross Total", ascending=False)
+        money_cols = ["Gross Total", "IGST", "CGST", "SGST"]
+        lastrow = _write_df(ws, df, money_cols=money_cols)
+        for r in range(2, lastrow + 1):
+            ws.cell(row=r, column=1).fill = YELLOW_FILL
+    else:
+        ws["A1"] = "Nothing found only in the Note Register."
+        ws["A1"].font = BOLD
+
+    ws = wb.create_sheet("Notes_Matched_Clean")
+    order.append("Notes_Matched_Clean")
+    if len(matched):
+        cols = ["gstin_gstr", "supplier_name", "note_no", "note_type", "note_date", "note_value", "itc_available"]
+        df = matched[cols].rename(columns={
+            "gstin_gstr": "GSTIN", "supplier_name": "Supplier Name", "note_no": "Note No",
+            "note_type": "Note Type", "note_date": "Note Date", "note_value": "Note Value",
+            "itc_available": "ITC Available",
+        })
+        _write_df(ws, df, money_cols=["Note Value"])
+
+    if pending:
+        wsP = wb.create_sheet("Notes_Pending_Conflicts")
+        order.insert(0, "Notes_Pending_Conflicts")
+        wsP["A1"] = ("These credit/debit notes were re-uploaded with a DIFFERENT amount than what's "
+                     "already stored. They are excluded from every figure in this report until you "
+                     "resolve each one as Overwrite (use the new value) or Ignore (keep the stored value).")
+        wsP["A1"].font = SUB_FONT
+        cols = ["GSTIN", "Voucher No", "Stored: Gross Total", "New Upload: Gross Total",
+                "Stored: CGST", "New Upload: CGST", "Stored: SGST", "New Upload: SGST",
+                "Stored: IGST", "New Upload: IGST", "Pending Entry ID (for resolving)"]
+        for j, c in enumerate(cols, start=1):
+            wsP.cell(row=3, column=j, value=c)
+        _style_header(wsP, 3, len(cols))
+        r = 4
+        for item in pending:
+            p, s = item["pending"], item["stored"]
+            vals = [p["gstin"], p["voucher_no"],
+                    s["gross_total"] if s else "", p["gross_total"],
+                    s["cgst"] if s else "", p["cgst"],
+                    s["sgst"] if s else "", p["sgst"],
+                    s["igst"] if s else "", p["igst"],
+                    p["id"]]
+            for j, v in enumerate(vals, start=1):
+                cell = wsP.cell(row=r, column=j, value=v)
+                cell.font = NORMAL
+                cell.border = BORDER
+                cell.fill = YELLOW_FILL
+            r += 1
+        for i in range(1, len(cols) + 1):
+            wsP.column_dimensions[get_column_letter(i)].width = 20
+
+    return order

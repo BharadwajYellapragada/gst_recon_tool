@@ -78,10 +78,57 @@ def run_fy_reconciliation(client_id, fy_label, late_filing_months=DEFAULT_LATE_F
     return {"results": results, "meta": meta}
 
 
+def run_fy_note_reconciliation(client_id, fy_label, late_filing_months=DEFAULT_LATE_FILING_MONTHS):
+    """
+    Reconciles the selected financial year's Credit/Debit Note Register entries
+    against a merged, de-duplicated view of every GSTR-2B B2B-CDNR snapshot
+    uploaded for this client (mirrors run_fy_reconciliation for the invoice side).
+
+    Unlike invoices, having no note data is a normal case (a client may simply have
+    no credit/debit notes for a period, or none uploaded yet) -- this returns
+    empty-but-valid results with meta['has_data']=False instead of raising, so it
+    never blocks producing the invoice-side report.
+
+    Returns a dict: results (category DataFrames + pending_conflicts), meta.
+    """
+    period_window = fy_utils.fy_period_window(fy_label, late_filing_months)
+
+    cdnr_df = db.get_merged_gstr2b_cdnr_notes(client_id, period_window)
+    notes_df = db.get_note_entries_by_fy(client_id, fy_label)
+
+    if len(cdnr_df) == 0 and len(notes_df) == 0:
+        empty = pd.DataFrame()
+        results = {"matched_clean": empty, "value_tax_mismatches": empty, "probable_matches": empty,
+                   "only_in_gstr2b_cdnr": empty, "only_in_note_register": empty, "pending_conflicts": []}
+        meta = {"has_data": False, "fy_label": fy_label,
+                "period_window_display": f"{period_window[0]} to {period_window[-1]}"}
+        return {"results": results, "meta": meta}
+
+    results = reconcile.run_note_reconciliation(cdnr_df, notes_df)
+    pending = db.list_pending_note_conflicts(client_id)
+    results["pending_conflicts"] = pending
+
+    meta = {
+        "has_data": True,
+        "fy_label": fy_label,
+        "period_window": period_window,
+        "period_window_display": f"{period_window[0]} to {period_window[-1]}",
+        "cdnr_row_count": len(cdnr_df),
+        "note_register_row_count": len(notes_df),
+        "pending_conflicts_count": len(pending),
+        "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return {"results": results, "meta": meta}
+
+
 def export_fy_reconciliation(client_id, fy_label, output_path, late_filing_months=DEFAULT_LATE_FILING_MONTHS):
-    """Runs the FY reconciliation and writes the formatted Excel report, logging the run."""
+    """Runs the FY reconciliation (invoices + credit/debit notes) and writes the
+    formatted Excel report, logging the run."""
     outcome = run_fy_reconciliation(client_id, fy_label, late_filing_months)
     results, meta = outcome["results"], outcome["meta"]
+
+    note_outcome = run_fy_note_reconciliation(client_id, fy_label, late_filing_months)
+    note_results, note_meta = note_outcome["results"], note_outcome["meta"]
 
     client = db.get_client(client_id)
     pr_df = db.get_purchase_entries_by_fy(client_id, fy_label)
@@ -89,7 +136,7 @@ def export_fy_reconciliation(client_id, fy_label, output_path, late_filing_month
 
     report.build_report(
         client["name"], client["gstin"], {}, purchase_asof, results, output_path,
-        fy_meta=meta,
+        fy_meta=meta, note_results=note_results, note_meta=note_meta,
     )
 
     summary = {k: len(v) for k, v in results.items() if k != "pending_conflicts"}
@@ -145,6 +192,42 @@ def export_gstr2a_snapshot(snapshot_id, output_path):
         "period": "Period", "gstin": "GSTIN", "supplier_name": "Supplier Name",
         "invoice_no": "Invoice No", "invoice_date": "Invoice Date", "invoice_value": "Invoice Value",
         "rate": "Rate", "taxable_value": "Taxable Value", "igst": "IGST", "cgst": "CGST",
+        "sgst": "SGST", "cess": "Cess", "filing_date": "Filing Date",
+        "itc_available": "ITC Available", "reason": "Reason",
+    })
+    out.to_excel(output_path, index=False)
+    return output_path
+
+
+def export_note_batch(batch_id, output_path):
+    """Exports every row a single Credit/Debit Note Register upload added, as a
+    plain Excel sheet -- mirrors export_purchase_batch."""
+    df = db.get_note_entries_by_batch(batch_id)
+    if len(df) == 0:
+        raise ValueError("No entries found for this upload batch.")
+    cols = ["entry_date", "particulars", "voucher_no", "voucher_date", "gstin",
+            "gross_total", "cgst", "sgst", "igst"]
+    out = df[cols].rename(columns={
+        "entry_date": "Date", "particulars": "Particulars", "voucher_no": "Voucher Ref. No.",
+        "voucher_date": "Voucher Ref. Date", "gstin": "GSTIN/UIN", "gross_total": "Gross Total",
+        "cgst": "CGST", "sgst": "SGST", "igst": "IGST",
+    })
+    out.to_excel(output_path, index=False)
+    return output_path
+
+
+def export_gstr2b_cdnr_notes(snapshot_id, output_path):
+    """Exports a GSTR-2B snapshot's stored B2B-CDNR notes as a plain Excel sheet —
+    mirrors export_gstr2a_snapshot."""
+    df = db.get_cdnr_notes_for_snapshot(snapshot_id)
+    if len(df) == 0:
+        raise ValueError("No credit/debit notes found for this snapshot.")
+    cols = ["period", "gstin", "supplier_name", "note_no", "note_type", "note_date", "note_value",
+            "taxable_value", "igst", "cgst", "sgst", "cess", "filing_date", "itc_available", "reason"]
+    out = df[cols].rename(columns={
+        "period": "Period", "gstin": "GSTIN", "supplier_name": "Supplier Name",
+        "note_no": "Note No", "note_type": "Note Type", "note_date": "Note Date",
+        "note_value": "Note Value", "taxable_value": "Taxable Value", "igst": "IGST", "cgst": "CGST",
         "sgst": "SGST", "cess": "Cess", "filing_date": "Filing Date",
         "itc_available": "ITC Available", "reason": "Reason",
     })
